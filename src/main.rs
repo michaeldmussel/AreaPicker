@@ -20,6 +20,7 @@ impl Bounds {
 
 struct ClickJob {
     running: Arc<AtomicBool>,
+    #[allow(dead_code)] // Used through Arc clone in spawn
     config: Arc<Mutex<ClickConfig>>,
 }
 
@@ -161,17 +162,24 @@ impl AppState {
     }
 
     fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
-        // Use winit to get all monitor info
-        let event_loop = winit::event_loop::EventLoop::new()
-            .expect("Failed to create event loop");
-        let monitors: Vec<_> = event_loop.available_monitors().collect();
+        // Use enigo to get the main display size as a fallback
+        let en = enigo::Enigo::new();
+        let (w, h) = en.main_display_size();
         
-        let mut min_x = i32::MAX;
-        let mut min_y = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut max_y = i32::MIN;
-        
-        for monitor in monitors {
+        // Try to get multi-monitor info using winit, but fallback to main display if it fails
+        match winit::event_loop::EventLoop::new() {
+            Ok(event_loop) => {
+                let monitors: Vec<_> = event_loop.available_monitors().collect();
+                if monitors.is_empty() {
+                    return (0, 0, w as i32, h as i32);
+                }
+                
+                let mut min_x = i32::MAX;
+                let mut min_y = i32::MAX;
+                let mut max_x = i32::MIN;
+                let mut max_y = i32::MIN;
+                
+                for monitor in monitors {
             let position = monitor.position();
             let size = monitor.size();
             
@@ -180,15 +188,18 @@ impl AppState {
             max_x = max_x.max(position.x + size.width as i32);
             max_y = max_y.max(position.y + size.height as i32);
         }
-        
-        // Fallback to main display if no monitors found
-        if min_x == i32::MAX {
-            let en = enigo::Enigo::new();
-            let (w, h) = en.main_display_size();
-            return (0, 0, w as i32, h as i32);
+                
+                if min_x == i32::MAX {
+                    (0, 0, w as i32, h as i32)
+                } else {
+                    (min_x, min_y, max_x, max_y)
+                }
+            }
+            Err(_) => {
+                // Fallback to main display if winit fails
+                (0, 0, w as i32, h as i32)
+            }
         }
-        
-        (min_x, min_y, max_x, max_y)
     }
 
     fn bounds_from_drag(&mut self) {
@@ -434,7 +445,8 @@ fn main() -> eframe::Result<()> {
     let mut opts = eframe::NativeOptions::default();
     opts.viewport.inner_size = Some(egui::vec2(520.0, 380.0));
     opts.viewport.transparent = Some(true);
-    opts.viewport.maximized = Some(true);
+    opts.viewport.maximized = Some(false); // Don't maximize by default
+    opts.viewport.resizable = Some(true);
     opts.follow_system_theme = true;
     
     eframe::run_native(
