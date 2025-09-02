@@ -187,6 +187,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rdev",
+ "winit",
 ]
 
 [[package]]

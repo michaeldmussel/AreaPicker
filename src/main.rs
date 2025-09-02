@@ -1,4 +1,5 @@
-use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, Vec2}};
+use eframe::{egui, egui::{Color32, Pos2, Rect, Sense}};
+use enigo::{self, MouseButton, MouseControllable};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -37,6 +38,8 @@ impl ClickJob {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let config_clone = Arc::clone(&config);
+        
+        eprintln!("Starting click job with config: {:?}", config.lock());
 
         thread::spawn(move || {
             let mut rng = rand::thread_rng();
@@ -61,10 +64,10 @@ impl ClickJob {
                     en.mouse_move_to(x, y);
                     match cfg.button {
                         ClickButton::Left => {
-                            en.mouse_click(enigo::MouseButton::Left);
+                            en.mouse_click(MouseButton::Left);
                         }
                         ClickButton::Right => {
-                            en.mouse_click(enigo::MouseButton::Right);
+                            en.mouse_click(MouseButton::Right);
                         }
                     }
                 }
@@ -94,6 +97,7 @@ struct AppState {
     picking_area: bool,
     drag_start: Option<Pos2>,
     drag_end: Option<Pos2>,
+    window_visible: bool,
 
     bounds_inputs: [i32; 4], // min_x, max_x, min_y, max_y
     click_button_left: bool,
@@ -110,6 +114,7 @@ impl Default for AppState {
             picking_area: false,
             drag_start: None,
             drag_end: None,
+            window_visible: true,
 
             bounds_inputs: [100, 400, 100, 400],
             click_button_left: true,
@@ -145,9 +150,45 @@ impl AppState {
         self.job = Some(ClickJob::spawn(Arc::clone(&self.config)));
     }
 
+    fn stop(&mut self) {
+        if let Some(job) = &self.job { job.stop(); }
+        self.job = None;
+    }
+
     fn pause(&mut self) {
         if let Some(job) = &self.job { job.stop(); }
         self.job = None;
+    }
+
+    fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
+        // Use winit to get all monitor info
+        let event_loop = winit::event_loop::EventLoop::new()
+            .expect("Failed to create event loop");
+        let monitors: Vec<_> = event_loop.available_monitors().collect();
+        
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        
+        for monitor in monitors {
+            let position = monitor.position();
+            let size = monitor.size();
+            
+            min_x = min_x.min(position.x);
+            min_y = min_y.min(position.y);
+            max_x = max_x.max(position.x + size.width as i32);
+            max_y = max_y.max(position.y + size.height as i32);
+        }
+        
+        // Fallback to main display if no monitors found
+        if min_x == i32::MAX {
+            let en = enigo::Enigo::new();
+            let (w, h) = en.main_display_size();
+            return (0, 0, w as i32, h as i32);
+        }
+        
+        (min_x, min_y, max_x, max_y)
     }
 
     fn bounds_from_drag(&mut self) {
@@ -164,13 +205,33 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Fullscreen picking overlay
         if self.picking_area {
-            let painter = egui::Painter::new(ctx.layer_id(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"))), egui::Rect::EVERYTHING);
-            let screen_rect = ctx.input(|i| i.screen_rect());
-            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 30));
+            // When in picking mode, make window transparent first
+            if self.window_visible {
+                self.window_visible = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(0.0, 0.0)));
+                return;
+            }
+            
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
+            
+            // Get the screen dimensions
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let width = max_x - min_x;
+            let height = max_y - min_y;
+            let screen_rect = egui::Rect::from_min_size(
+                Pos2::new(min_x as f32, min_y as f32),
+                egui::vec2(width as f32, height as f32)
+            );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
 
-            egui::Area::new("picker_area").order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
                 let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
                 if resp.drag_started() {
                     self.drag_start = Some(resp.interact_pointer_pos().unwrap_or(Pos2::new(0.0,0.0)));
@@ -179,10 +240,12 @@ impl eframe::App for AppState {
                 if resp.dragged() {
                     self.drag_end = resp.interact_pointer_pos();
                 }
-                if resp.drag_released() {
+                if resp.drag_stopped() {
                     self.drag_end = resp.interact_pointer_pos();
                     self.bounds_from_drag();
                     self.picking_area = false;
+                    // After area is picked, just make window visible again
+                    self.window_visible = true;
                 }
 
                 if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
@@ -209,7 +272,10 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
                     ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
                     if ui.button("Pick Area (drag a rectangle)").clicked() { 
-                        self.drag_start = None; self.drag_end = None; self.picking_area = true; 
+                        self.drag_start = None;
+                        self.drag_end = None;
+                        self.picking_area = true;
+                        self.window_visible = true; // Will be set to false on next frame
                     }
                 });
 
@@ -232,13 +298,14 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| {
                         if ui.button("Start").clicked() { self.start(); }
                         if ui.button("Pause").clicked() { self.pause(); }
+                        if ui.button("Stop").clicked() { self.stop(); }
                     });
 
                     if let Some(job) = &self.job {
                         let running = job.running.load(Ordering::Relaxed);
-                        ui.label(format!("Status: {}", if running {"Running"} else {"Paused"}));
+                        ui.label(format!("Status: {}", if running {"Running"} else {"Stopped"}));
                     } else {
-                        ui.label("Status: Paused");
+                        ui.label("Status: Stopped");
                     }
                 });
             });
@@ -253,14 +320,129 @@ impl eframe::App for AppState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::Pos2;
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn test_bounds_validation() {
+        let valid_bounds = Bounds {
+            min_x: 100,
+            max_x: 200,
+            min_y: 100,
+            max_y: 200,
+        };
+        assert!(valid_bounds.is_valid());
+        assert_eq!(valid_bounds.width(), 100);
+        assert_eq!(valid_bounds.height(), 100);
+
+        let invalid_bounds = Bounds {
+            min_x: 200,
+            max_x: 100,
+            min_y: 200,
+            max_y: 100,
+        };
+        assert!(!invalid_bounds.is_valid());
+    }
+
+    #[test]
+    fn test_click_job_creation() {
+        let config = Arc::new(Mutex::new(ClickConfig {
+            bounds: Some(Bounds {
+                min_x: 100,
+                max_x: 200,
+                min_y: 100,
+                max_y: 200,
+            }),
+            button: ClickButton::Left,
+            min_secs: 1.0,
+            max_secs: 2.0,
+        }));
+
+        let job = ClickJob::spawn(Arc::clone(&config));
+        assert!(job.running.load(Ordering::Relaxed));
+
+        // Test stopping
+        job.stop();
+        assert!(!job.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_app_state_defaults() {
+        let state = AppState::default();
+        assert!(!state.picking_area);
+        assert!(state.drag_start.is_none());
+        assert!(state.drag_end.is_none());
+        assert!(state.click_button_left);
+        assert!(state.job.is_none());
+        
+        // Check default bounds
+        assert_eq!(state.bounds_inputs, [100, 400, 100, 400]);
+        
+        // Check default timing
+        assert_eq!(state.min_secs, 1.0);
+        assert_eq!(state.max_secs, 3.0);
+    }
+
+    #[test]
+    fn test_bounds_from_drag() {
+        let mut state = AppState::default();
+        
+        // Test drag selection
+        state.drag_start = Some(Pos2::new(100.0, 100.0));
+        state.drag_end = Some(Pos2::new(200.0, 200.0));
+        state.bounds_from_drag();
+
+        assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
+        
+        // Test reverse drag (from bottom-right to top-left)
+        state.drag_start = Some(Pos2::new(200.0, 200.0));
+        state.drag_end = Some(Pos2::new(100.0, 100.0));
+        state.bounds_from_drag();
+
+        assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
+    }
+
+    #[test]
+    fn test_click_interval() {
+        let config = Arc::new(Mutex::new(ClickConfig {
+            bounds: Some(Bounds {
+                min_x: 100,
+                max_x: 200,
+                min_y: 100,
+                max_y: 200,
+            }),
+            button: ClickButton::Left,
+            min_secs: 0.1,
+            max_secs: 0.2,
+        }));
+
+        let job = ClickJob::spawn(Arc::clone(&config));
+        
+        // Let it run briefly to ensure it's working
+        std::thread::sleep(Duration::from_millis(500));
+        
+        job.stop();
+        assert!(!job.running.load(Ordering::Relaxed));
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    let opts = eframe::NativeOptions{
-        initial_window_size: Some(Vec2::new(520.0, 380.0)),
-        ..Default::default()
-    };
+    let mut opts = eframe::NativeOptions::default();
+    opts.viewport.inner_size = Some(egui::vec2(520.0, 380.0));
+    opts.viewport.transparent = Some(true);
+    opts.viewport.maximized = Some(true);
+    opts.follow_system_theme = true;
+    
     eframe::run_native(
         "Area Clicker",
         opts,
-        Box::new(|_| Box::<AppState>::default()),
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Box::<AppState>::default()
+        }),
     )
 }
