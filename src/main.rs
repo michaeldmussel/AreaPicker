@@ -94,6 +94,13 @@ impl ClickJob {
 }
 
 // -------------- UI State --------------
+// Store screen bounds information
+static SCREEN_BOUNDS: Lazy<(i32, i32, i32, i32)> = Lazy::new(|| {
+    let en = enigo::Enigo::new();
+    let (w, h) = en.main_display_size();
+    (0, 0, w as i32, h as i32)
+});
+
 struct AppState {
     picking_area: bool,
     drag_start: Option<Pos2>,
@@ -162,54 +169,27 @@ impl AppState {
     }
 
     fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
-        // Use enigo to get the main display size as a fallback
-        let en = enigo::Enigo::new();
-        let (w, h) = en.main_display_size();
-        
-        // Try to get multi-monitor info using winit, but fallback to main display if it fails
-        match winit::event_loop::EventLoop::new() {
-            Ok(event_loop) => {
-                let monitors: Vec<_> = event_loop.available_monitors().collect();
-                if monitors.is_empty() {
-                    return (0, 0, w as i32, h as i32);
-                }
-                
-                let mut min_x = i32::MAX;
-                let mut min_y = i32::MAX;
-                let mut max_x = i32::MIN;
-                let mut max_y = i32::MIN;
-                
-                for monitor in monitors {
-            let position = monitor.position();
-            let size = monitor.size();
-            
-            min_x = min_x.min(position.x);
-            min_y = min_y.min(position.y);
-            max_x = max_x.max(position.x + size.width as i32);
-            max_y = max_y.max(position.y + size.height as i32);
-        }
-                
-                if min_x == i32::MAX {
-                    (0, 0, w as i32, h as i32)
-                } else {
-                    (min_x, min_y, max_x, max_y)
-                }
-            }
-            Err(_) => {
-                // Fallback to main display if winit fails
-                (0, 0, w as i32, h as i32)
-            }
-        }
+        *SCREEN_BOUNDS
     }
 
     fn bounds_from_drag(&mut self) {
         if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
-            let min_x = a.x.min(b.x).round() as i32;
-            let max_x = a.x.max(b.x).round() as i32;
-            let min_y = a.y.min(b.y).round() as i32;
-            let max_y = a.y.max(b.y).round() as i32;
+            // Use raw screen coordinates directly
+            let raw_min_x = a.x.round() as i32;
+            let raw_max_x = b.x.round() as i32;
+            let raw_min_y = a.y.round() as i32;
+            let raw_max_y = b.y.round() as i32;
+            
+            // Ensure min/max are in correct order
+            let min_x = raw_min_x.min(raw_max_x);
+            let max_x = raw_min_x.max(raw_max_x);
+            let min_y = raw_min_y.min(raw_max_y);
+            let max_y = raw_min_y.max(raw_max_y);
+            
             self.bounds_inputs = [min_x, max_x, min_y, max_y];
             self.config.lock().bounds = Some(Bounds{min_x, max_x, min_y, max_y});
+            
+            eprintln!("Selected bounds: x=[{}..{}], y=[{}..{}]", min_x, max_x, min_y, max_y);
         }
     }
 }
@@ -217,10 +197,21 @@ impl AppState {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.picking_area {
-            // When in picking mode, make window transparent first
+            // When in picking mode, make window fullscreen and translucent
             if self.window_visible {
                 self.window_visible = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(0.0, 0.0)));
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
                 return;
             }
             
@@ -231,32 +222,43 @@ impl eframe::App for AppState {
                 egui::Rect::EVERYTHING,
             );
             
-            // Get the screen dimensions
+            // Get the screen dimensions and create rect in absolute coordinates
             let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
-            let width = max_x - min_x;
-            let height = max_y - min_y;
-            let screen_rect = egui::Rect::from_min_size(
+            let screen_rect = egui::Rect::from_min_max(
                 Pos2::new(min_x as f32, min_y as f32),
-                egui::vec2(width as f32, height as f32)
+                Pos2::new(max_x as f32, max_y as f32)
             );
             
             painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
 
             egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
                 let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                
+                // Get absolute screen coordinates using winit
+                let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                    // Use raw cursor position directly
+                    Pos2::new(pos.x, pos.y)
+                } else {
+                    Pos2::new(0.0, 0.0)
+                };
+                
                 if resp.drag_started() {
-                    self.drag_start = Some(resp.interact_pointer_pos().unwrap_or(Pos2::new(0.0,0.0)));
+                    self.drag_start = Some(absolute_pos);
                     self.drag_end = self.drag_start;
                 }
                 if resp.dragged() {
-                    self.drag_end = resp.interact_pointer_pos();
+                    self.drag_end = Some(absolute_pos);
                 }
                 if resp.drag_stopped() {
-                    self.drag_end = resp.interact_pointer_pos();
+                    self.drag_end = Some(absolute_pos);
                     self.bounds_from_drag();
                     self.picking_area = false;
-                    // After area is picked, just make window visible again
+                    // Restore window to normal state
                     self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    // Reset window size to default
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
                 }
 
                 if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
@@ -442,11 +444,16 @@ mod tests {
 }
 
 fn main() -> eframe::Result<()> {
+    // Initialize with default display size
+    let en = enigo::Enigo::new();
+    let (w, h) = en.main_display_size();
+    
     let mut opts = eframe::NativeOptions::default();
-    opts.viewport.inner_size = Some(egui::vec2(520.0, 380.0));
+    opts.viewport.inner_size = Some(egui::vec2(w as f32, h as f32));
     opts.viewport.transparent = Some(true);
-    opts.viewport.maximized = Some(false); // Don't maximize by default
+    opts.viewport.maximized = Some(true); // Start maximized
     opts.viewport.resizable = Some(true);
+    opts.viewport.mouse_passthrough = Some(false); // Ensure we can capture mouse events
     opts.follow_system_theme = true;
     
     eframe::run_native(
