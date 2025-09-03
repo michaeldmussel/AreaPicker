@@ -1,4 +1,4 @@
-use eframe::{egui, egui::{Color32, Pos2, Rect, Sense}};
+use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
 use enigo::{self, MouseButton, MouseControllable};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -39,7 +39,7 @@ impl ClickJob {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let config_clone = Arc::clone(&config);
-        
+
         eprintln!("Starting click job with config: {:?}", config.lock());
 
         thread::spawn(move || {
@@ -59,17 +59,13 @@ impl ClickJob {
                 let x = rng.gen_range(b.min_x..=b.max_x);
                 let y = rng.gen_range(b.min_y..=b.max_y);
 
-                // Move & click
+                // Move & click (absolute physical pixels)
                 {
                     let mut en = ENIGO.lock();
                     en.mouse_move_to(x, y);
                     match cfg.button {
-                        ClickButton::Left => {
-                            en.mouse_click(MouseButton::Left);
-                        }
-                        ClickButton::Right => {
-                            en.mouse_click(MouseButton::Right);
-                        }
+                        ClickButton::Left => en.mouse_click(MouseButton::Left),
+                        ClickButton::Right => en.mouse_click(MouseButton::Right),
                     }
                 }
 
@@ -93,48 +89,122 @@ impl ClickJob {
     fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
 }
 
-// -------------- UI State --------------
-// Store screen bounds information
-static SCREEN_BOUNDS: Lazy<(i32, i32, i32, i32)> = Lazy::new(|| {
-    let en = enigo::Enigo::new();
-    let (w, h) = en.main_display_size();
-    (0, 0, w as i32, h as i32)
-});
+// -------------- Display Info --------------
+#[derive(Clone, Debug)]
+struct Monitor {
+    #[allow(dead_code)]
+    id: u32,
+    name: String,
+    origin_px: (i32, i32),
+    size_px: (i32, i32),
+    #[allow(dead_code)]
+    scale_factor: f32,
+}
 
+
+fn query_monitors() -> Vec<Monitor> {
+    match display_info::DisplayInfo::all() {
+        Ok(displays) if !displays.is_empty() => {
+            displays
+                .into_iter()
+                .map(|d| Monitor {
+                    id: d.id,
+                    // v0.4.x has no `.name`; make a friendly one
+                    name: if d.is_primary {
+                        format!("Display {} (Primary)", d.id)
+                    } else {
+                        format!("Display {}", d.id)
+                    },
+                    origin_px: (d.x, d.y),                            // i32
+                    size_px: (d.width as i32, d.height as i32),       // u32 -> i32
+                    scale_factor: d.scale_factor as f32,              // usually f32 already
+                })
+                .collect()
+        }
+        _ => {
+            // Fallback: single main display using Enigo
+            let en = enigo::Enigo::new();
+            let (w, h) = en.main_display_size();
+            vec![Monitor {
+                id: 0,
+                name: "Main display".to_string(),
+                origin_px: (0, 0),
+                size_px: (w as i32, h as i32),
+                scale_factor: 1.0,
+            }]
+        }
+    }
+}
+
+
+fn union_rect(monitors: &[Monitor]) -> (i32, i32, i32, i32) {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for m in monitors {
+        min_x = min_x.min(m.origin_px.0);
+        min_y = min_y.min(m.origin_px.1);
+        max_x = max_x.max(m.origin_px.0 + m.size_px.0);
+        max_y = max_y.max(m.origin_px.1 + m.size_px.1);
+    }
+    if monitors.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        (min_x, min_y, max_x, max_y)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DisplayChoice {
+    All,
+    One(usize), // index into monitors
+}
+
+// -------------- UI State --------------
 struct AppState {
+    // Picker state
     picking_area: bool,
     drag_start: Option<Pos2>,
     drag_end: Option<Pos2>,
-    window_visible: bool,
 
+    // Display state
+    monitors: Vec<Monitor>,
+    display_choice: DisplayChoice,
+
+    // Config inputs
     bounds_inputs: [i32; 4], // min_x, max_x, min_y, max_y
     click_button_left: bool,
     min_secs: f32,
     max_secs: f32,
 
+    // Engine
     job: Option<ClickJob>,
     config: Arc<Mutex<ClickConfig>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let monitors = query_monitors();
         Self {
             picking_area: false,
             drag_start: None,
             drag_end: None,
-            window_visible: true,
+
+            monitors,
+            display_choice: DisplayChoice::All,
 
             bounds_inputs: [100, 400, 100, 400],
             click_button_left: true,
-            min_secs: 1.0,
-            max_secs: 3.0,
+            min_secs: 2.0,
+            max_secs: 4.5,
 
             job: None,
             config: Arc::new(Mutex::new(ClickConfig{
                 bounds: Some(Bounds{min_x:100, max_x:400, min_y:100, max_y:400}),
                 button: ClickButton::Left,
-                min_secs: 1.0,
-                max_secs: 3.0,
+                min_secs: 2.0,
+                max_secs: 4.5,
             })),
         }
     }
@@ -143,7 +213,6 @@ impl Default for AppState {
 impl AppState {
     fn start(&mut self) {
         if self.job.is_some() { return; }
-        // sync current config
         let mut cfg = self.config.lock();
         cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
         cfg.min_secs = self.min_secs;
@@ -168,164 +237,214 @@ impl AppState {
         self.job = None;
     }
 
-    fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
-        *SCREEN_BOUNDS
+    fn refresh_monitors(&mut self) {
+        self.monitors = query_monitors();
+        // Clamp selection if out-of-range
+        if let DisplayChoice::One(i) = self.display_choice {
+            if i >= self.monitors.len() {
+                self.display_choice = DisplayChoice::All;
+            }
+        }
     }
 
-    fn bounds_from_drag(&mut self) {
+    fn enter_picker(&mut self, ctx: &egui::Context) {
+        self.drag_start = None;
+        self.drag_end = None;
+        self.picking_area = true;
+
+        // choose target rectangle in PHYSICAL pixels
+        let (origin_px, size_px) = match self.display_choice {
+            DisplayChoice::All => {
+                let (min_x, min_y, max_x, max_y) = union_rect(&self.monitors);
+                ((min_x, min_y), (max_x - min_x, max_y - min_y))
+            }
+            DisplayChoice::One(i) => {
+                if let Some(m) = self.monitors.get(i) {
+                    (m.origin_px, m.size_px)
+                } else {
+                    // fallback: union
+                    let (min_x, min_y, max_x, max_y) = union_rect(&self.monitors);
+                    ((min_x, min_y), (max_x - min_x, max_y - min_y))
+                }
+            }
+        };
+
+        // convert to LOGICAL points for egui/eframe viewport commands
+        let ppp = ctx.pixels_per_point().max(0.1);
+        let inner = egui::vec2(size_px.0 as f32 / ppp, size_px.1 as f32 / ppp);
+        let outer = egui::pos2(origin_px.0 as f32 / ppp, origin_px.1 as f32 / ppp);
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner));
+        // Note: using borderless large window; not true OS fullscreen to avoid monitor switching quirks.
+    }
+
+    fn exit_picker(&mut self, ctx: &egui::Context) {
+        self.picking_area = false;
+        // restore a comfy window
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::Normal));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(520.0, 380.0)));
+    }
+
+    /// Convert current drag (logical points in current window) into PHYSICAL pixel bounds,
+    /// offset by the selected monitor or union origin.
+    fn set_bounds_from_drag(&mut self, ppp: f32, origin_px: (i32, i32)) {
         if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
-            // Use raw screen coordinates directly
-            let raw_min_x = a.x.round() as i32;
-            let raw_max_x = b.x.round() as i32;
-            let raw_min_y = a.y.round() as i32;
-            let raw_max_y = b.y.round() as i32;
-            
-            // Ensure min/max are in correct order
-            let min_x = raw_min_x.min(raw_max_x);
-            let max_x = raw_min_x.max(raw_max_x);
-            let min_y = raw_min_y.min(raw_max_y);
-            let max_y = raw_min_y.max(raw_max_y);
-            
+            let to_px = |p: Pos2| ((p.x * ppp).round() as i32, (p.y * ppp).round() as i32);
+            let (ax, ay) = to_px(a);
+            let (bx, by) = to_px(b);
+
+            let min_x = ax.min(bx) + origin_px.0;
+            let max_x = ax.max(bx) + origin_px.0;
+            let min_y = ay.min(by) + origin_px.1;
+            let max_y = ay.max(by) + origin_px.1;
+
             self.bounds_inputs = [min_x, max_x, min_y, max_y];
             self.config.lock().bounds = Some(Bounds{min_x, max_x, min_y, max_y});
-            
-            eprintln!("Selected bounds: x=[{}..{}], y=[{}..{}]", min_x, max_x, min_y, max_y);
+            eprintln!("Selected bounds (px): x=[{}..{}], y=[{}..{}]", min_x, max_x, min_y, max_y);
         }
     }
 }
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // -------- Picker Overlay --------
         if self.picking_area {
-            // When in picking mode, make window fullscreen and translucent
-            if self.window_visible {
-                self.window_visible = false;
-                // Get screen dimensions
-                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
-                let width = max_x - min_x;
-                let height = max_y - min_y;
-                
-                // Make window fullscreen and center it
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
-                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
-                    ctx.send_viewport_cmd(cmd);
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                return;
-            }
-            
+            let screen_rect = ctx.screen_rect();
             let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
-            let painter = egui::Painter::new(
-                ctx.clone(),
-                layer_id,
-                egui::Rect::EVERYTHING,
-            );
-            
-            // Get the screen dimensions and create rect in absolute coordinates
-            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
-            let screen_rect = egui::Rect::from_min_max(
-                Pos2::new(min_x as f32, min_y as f32),
-                Pos2::new(max_x as f32, max_y as f32)
-            );
-            
-            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
+            let painter = egui::Painter::new(ctx.clone(), layer_id, egui::Rect::EVERYTHING);
 
-            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
-                let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
-                
-                // Get absolute screen coordinates using winit
-                let absolute_pos = if let Some(pos) = resp.hover_pos() {
-                    // Use raw cursor position directly
-                    Pos2::new(pos.x, pos.y)
-                } else {
-                    Pos2::new(0.0, 0.0)
-                };
-                
-                if resp.drag_started() {
-                    self.drag_start = Some(absolute_pos);
-                    self.drag_end = self.drag_start;
-                }
-                if resp.dragged() {
-                    self.drag_end = Some(absolute_pos);
-                }
-                if resp.drag_stopped() {
-                    self.drag_end = Some(absolute_pos);
-                    self.bounds_from_drag();
-                    self.picking_area = false;
-                    // Restore window to normal state
-                    self.window_visible = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-                    // Reset window size to default
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
-                }
+            // Gray translucent overlay
+            painter.rect_filled(
+                screen_rect,
+                0.0,
+                Color32::from_rgba_premultiplied(128, 128, 128, 100),
+            );
 
-                if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
-                    let rect = Rect::from_two_pos(a, b);
-                    let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
-                    painter.rect_stroke(rect, 0.0, stroke);
-                }
-            });
+            // Interaction area
+            egui::Area::new(egui::Id::new("picker_area"))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                    if resp.drag_started() {
+                        self.drag_start = resp.interact_pointer_pos();
+                        self.drag_end = self.drag_start;
+                    }
+                    if resp.dragged() {
+                        self.drag_end = resp.interact_pointer_pos();
+                    }
+                    if resp.drag_stopped() {
+                        self.drag_end = resp.interact_pointer_pos();
+
+                        // Determine origin_px to add (depends on selected target)
+                        let origin_px = match self.display_choice {
+                            DisplayChoice::All => {
+                                let (min_x, min_y, _max_x, _max_y) = union_rect(&self.monitors);
+                                (min_x, min_y)
+                            }
+                            DisplayChoice::One(i) => {
+                                self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0))
+                            }
+                        };
+                        let ppp = ctx.pixels_per_point().max(0.1);
+                        self.set_bounds_from_drag(ppp, origin_px);
+                        self.exit_picker(ctx);
+                    }
+
+                    if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                        let rect = Rect::from_two_pos(a, b);
+                        let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                        painter.rect_stroke(rect, 0.0, stroke);
+                    }
+                });
 
             ctx.request_repaint();
             return; // Skip main UI while picking
         }
 
+        // -------- Main UI --------
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.heading("Area Clicker — MVP");
+            ui.heading("Area Clicker — Multi-Display");
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.group(|ui| {
-                    ui.label("Selection (px, screen coords)");
-                    ui.horizontal(|ui| { ui.label("min X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[0])); });
-                    ui.horizontal(|ui| { ui.label("max X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[1])); });
-                    ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
-                    ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
-                    if ui.button("Pick Area (drag a rectangle)").clicked() { 
-                        self.drag_start = None;
-                        self.drag_end = None;
-                        self.picking_area = true;
-                        self.window_visible = true; // Will be set to false on next frame
-                    }
-                });
+                ui.vertical(|ui| {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Target display:");
+                            egui::ComboBox::from_id_source("display_select")
+                                .selected_text(match self.display_choice {
+                                    DisplayChoice::All => "All displays".into(),
+                                    DisplayChoice::One(i) => self.monitors.get(i)
+                                        .map(|m| m.name.clone())
+                                        .unwrap_or_else(|| "Unknown".into()),
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.display_choice, DisplayChoice::All, "All displays");
+                                    for (i, m) in self.monitors.iter().enumerate() {
+                                        ui.selectable_value(&mut self.display_choice, DisplayChoice::One(i), &m.name);
+                                    }
+                                });
 
-                ui.separator();
+                            if ui.button("↻ Refresh").clicked() {
+                                self.refresh_monitors();
+                            }
+                        });
 
-                ui.group(|ui| {
-                    ui.label("Settings");
-                    ui.horizontal(|ui| {
-                        ui.label("Click type:");
-                        ui.checkbox(&mut self.click_button_left, "Left");
-                        let mut right = !self.click_button_left;
-                        if ui.checkbox(&mut right, "Right").clicked() { self.click_button_left = !right; }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Interval (seconds):");
-                        ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
-                        ui.label("to");
-                        ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Start").clicked() { self.start(); }
-                        if ui.button("Pause").clicked() { self.pause(); }
-                        if ui.button("Stop").clicked() { self.stop(); }
+                        ui.separator();
+
+                        ui.label("Selection (px, screen coords)");
+                        ui.horizontal(|ui| { ui.label("min X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[0])); });
+                        ui.horizontal(|ui| { ui.label("max X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[1])); });
+                        ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
+                        ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
+
+                        if ui.button("Pick Area (drag a rectangle)").clicked() {
+                            self.enter_picker(ctx);
+                        }
                     });
 
-                    if let Some(job) = &self.job {
-                        let running = job.running.load(Ordering::Relaxed);
-                        ui.label(format!("Status: {}", if running {"Running"} else {"Stopped"}));
-                    } else {
-                        ui.label("Status: Stopped");
-                    }
+                    ui.separator();
+
+                    ui.group(|ui| {
+                        ui.label("Settings");
+                        ui.horizontal(|ui| {
+                            ui.label("Click type:");
+                            ui.checkbox(&mut self.click_button_left, "Left");
+                            let mut right = !self.click_button_left;
+                            if ui.checkbox(&mut right, "Right").clicked() { self.click_button_left = !right; }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Interval (seconds):");
+                            ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
+                            ui.label("to");
+                            ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Start").clicked() { self.start(); }
+                            if ui.button("Pause").clicked() { self.pause(); }
+                            if ui.button("Stop").clicked() { self.stop(); }
+                        });
+
+                        if let Some(job) = &self.job {
+                            let running = job.running.load(Ordering::Relaxed);
+                            ui.label(format!("Status: {}", if running {"Running"} else {"Stopped"}));
+                        } else {
+                            ui.label("Status: Stopped");
+                        }
+                    });
                 });
             });
 
             // Preview rectangle
             if let Some(b) = self.config.lock().bounds {
-                let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})", b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
+                let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})",
+                                   b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
                 ui.separator();
                 ui.monospace(info);
             }
@@ -342,37 +461,22 @@ mod tests {
 
     #[test]
     fn test_bounds_validation() {
-        let valid_bounds = Bounds {
-            min_x: 100,
-            max_x: 200,
-            min_y: 100,
-            max_y: 200,
-        };
+        let valid_bounds = Bounds { min_x: 100, max_x: 200, min_y: 100, max_y: 200 };
         assert!(valid_bounds.is_valid());
         assert_eq!(valid_bounds.width(), 100);
         assert_eq!(valid_bounds.height(), 100);
 
-        let invalid_bounds = Bounds {
-            min_x: 200,
-            max_x: 100,
-            min_y: 200,
-            max_y: 100,
-        };
+        let invalid_bounds = Bounds { min_x: 200, max_x: 100, min_y: 200, max_y: 100 };
         assert!(!invalid_bounds.is_valid());
     }
 
     #[test]
     fn test_click_job_creation() {
         let config = Arc::new(Mutex::new(ClickConfig {
-            bounds: Some(Bounds {
-                min_x: 100,
-                max_x: 200,
-                min_y: 100,
-                max_y: 200,
-            }),
+            bounds: Some(Bounds { min_x: 100, max_x: 200, min_y: 100, max_y: 200 }),
             button: ClickButton::Left,
-            min_secs: 1.0,
-            max_secs: 2.0,
+            min_secs: 2.0,
+            max_secs: 4.5,
         }));
 
         let job = ClickJob::spawn(Arc::clone(&config));
@@ -391,71 +495,51 @@ mod tests {
         assert!(state.drag_end.is_none());
         assert!(state.click_button_left);
         assert!(state.job.is_none());
-        
-        // Check default bounds
-        assert_eq!(state.bounds_inputs, [100, 400, 100, 400]);
-        
-        // Check default timing
-        assert_eq!(state.min_secs, 1.0);
-        assert_eq!(state.max_secs, 3.0);
+
+        // input defaults
+        assert_eq!(state.min_secs, 2.0);
+        assert_eq!(state.max_secs, 4.5);
     }
 
     #[test]
-    fn test_bounds_from_drag() {
+    fn test_set_bounds_from_drag_ppp1_origin0() {
         let mut state = AppState::default();
-        
-        // Test drag selection
         state.drag_start = Some(Pos2::new(100.0, 100.0));
-        state.drag_end = Some(Pos2::new(200.0, 200.0));
-        state.bounds_from_drag();
-
+        state.drag_end   = Some(Pos2::new(200.0, 200.0));
+        state.set_bounds_from_drag(1.0, (0, 0));
         assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
-        
-        // Test reverse drag (from bottom-right to top-left)
-        state.drag_start = Some(Pos2::new(200.0, 200.0));
-        state.drag_end = Some(Pos2::new(100.0, 100.0));
-        state.bounds_from_drag();
 
+        // reverse drag
+        state.drag_start = Some(Pos2::new(200.0, 200.0));
+        state.drag_end   = Some(Pos2::new(100.0, 100.0));
+        state.set_bounds_from_drag(1.0, (0, 0));
         assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
     }
 
     #[test]
     fn test_click_interval() {
         let config = Arc::new(Mutex::new(ClickConfig {
-            bounds: Some(Bounds {
-                min_x: 100,
-                max_x: 200,
-                min_y: 100,
-                max_y: 200,
-            }),
+            bounds: Some(Bounds { min_x: 100, max_x: 200, min_y: 100, max_y: 200 }),
             button: ClickButton::Left,
             min_secs: 0.1,
             max_secs: 0.2,
         }));
 
         let job = ClickJob::spawn(Arc::clone(&config));
-        
-        // Let it run briefly to ensure it's working
-        std::thread::sleep(Duration::from_millis(500));
-        
+        std::thread::sleep(Duration::from_millis(300));
         job.stop();
         assert!(!job.running.load(Ordering::Relaxed));
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // Initialize with default display size
-    let en = enigo::Enigo::new();
-    let (w, h) = en.main_display_size();
-    
     let mut opts = eframe::NativeOptions::default();
-    opts.viewport.inner_size = Some(egui::vec2(w as f32, h as f32));
+    // Start as a normal window; we resize/position during picking.
     opts.viewport.transparent = Some(true);
-    opts.viewport.maximized = Some(true); // Start maximized
     opts.viewport.resizable = Some(true);
-    opts.viewport.mouse_passthrough = Some(false); // Ensure we can capture mouse events
+    opts.viewport.mouse_passthrough = Some(false); // Ensure we capture mouse events
     opts.follow_system_theme = true;
-    
+
     eframe::run_native(
         "Area Clicker",
         opts,
