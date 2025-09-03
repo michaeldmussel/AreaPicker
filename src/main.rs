@@ -1,10 +1,158 @@
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
-use enigo::{self, MouseButton, MouseControllable};
+use enigo::{MouseButton, MouseControllable};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand::Rng;
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
+use rand::{Rng, rngs::StdRng, SeedableRng};
+use std::{thread, time::Duration};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::f32::consts::PI;
 
+// Human Mouse Movement Settings
+struct HumanMouseSettings {
+    avg_speed: f32,
+    speed_jitter: f32,
+    micro_jitter_px: f32,
+    micro_jitter_hz: f32,
+    overshoot_chance: f32,
+    overshoot_px: f32,
+    min_pause_ms: u64,
+    max_pause_ms: u64,
+    rng_seed: Option<u64>,
+}
+
+impl Default for HumanMouseSettings {
+    fn default() -> Self {
+        Self {
+            avg_speed: 1400.0,
+            speed_jitter: 0.25,
+            micro_jitter_px: 0.6,
+            micro_jitter_hz: 9.0,
+            overshoot_chance: 0.25,
+            overshoot_px: 12.0,
+            min_pause_ms: 15,
+            max_pause_ms: 60,
+            rng_seed: None,
+        }
+    }
+}
+
+fn ease_in_out(t: f32) -> f32 {
+    0.5 - 0.5 * (PI * t).cos()
+}
+
+fn cubic_bezier(p0: (f32,f32), p1: (f32,f32), p2: (f32,f32), p3: (f32,f32), t: f32) -> (f32,f32) {
+    let u = 1.0 - t;
+    let uu = u * u;
+    let tt = t * t;
+    let uuu = uu * u;
+    let ttt = tt * t;
+    (
+        uuu*p0.0 + 3.0*uu*t*p1.0 + 3.0*u*tt*p2.0 + ttt*p3.0,
+        uuu*p0.1 + 3.0*uu*t*p1.1 + 3.0*u*tt*p2.1 + ttt*p3.1,
+    )
+}
+
+fn len((x1,y1): (f32,f32), (x2,y2): (f32,f32)) -> f32 {
+    ((x2-x1).hypot(y2-y1)).max(1.0)
+}
+
+fn make_bezier_with_wiggle(
+    from: (i32,i32), 
+    to: (i32,i32), 
+    rng: &mut impl Rng
+) -> ((f32,f32),(f32,f32),(f32,f32),(f32,f32)) {
+    let p0 = (from.0 as f32, from.1 as f32);
+    let p3 = (to.0 as f32, to.1 as f32);
+
+    let dx = p3.0 - p0.0;
+    let dy = p3.1 - p0.1;
+    let dist = len(p0, p3);
+    let (nx, ny) = if dist > 0.0 { (-dy / dist, dx / dist) } else { (0.0, 0.0) };
+
+    let cdist = 0.25 * dist;
+    let amp1 = rng.gen_range(-0.12..0.12) * dist;
+    let amp2 = rng.gen_range(-0.12..0.12) * dist;
+
+    let p1 = (p0.0 + dx * 0.30 + nx * amp1, p0.1 + dy * 0.30 + ny * amp1);
+    let p2 = (p0.0 + dx * 0.70 + nx * amp2, p0.1 + dy * 0.70 + ny * amp2);
+
+    let p1 = (p1.0 + (dx / dist) * (cdist * 0.1), p1.1 + (dy / dist) * (cdist * 0.1));
+    let p2 = (p2.0 - (dx / dist) * (cdist * 0.1), p2.1 - (dy / dist) * (cdist * 0.1));
+
+    (p0, p1, p2, p3)
+}
+
+fn human_move_and_click(
+    enigo: &mut impl MouseControllable,
+    from: (i32,i32),
+    to: (i32,i32),
+    bounds: Option<Bounds>,
+    settings: &HumanMouseSettings,
+    button: MouseButton,
+) {
+    let mut rng: StdRng = match settings.rng_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    };
+
+    let (p0, p1, p2, p3) = make_bezier_with_wiggle(from, to, &mut rng);
+    let distance = len(p0, p3);
+    let speed_variation = 1.0 + settings.speed_jitter * rng.gen_range(-1.0..1.0);
+    let px_per_sec = (settings.avg_speed * speed_variation).max(200.0);
+    let total_ms = ((distance / px_per_sec) * 1000.0).clamp(60.0, 1600.0) as u64;
+
+    let step_ms = rng.gen_range(8..=12);
+    let steps = (total_ms / step_ms.max(1)).max(3) as usize;
+    let maybe_pause_at = if rng.gen::<f32>() < 0.25 {
+        Some(rng.gen_range(steps/3..(2*steps/3).max(steps/3+1)))
+    } else {
+        None
+    };
+
+    let jitter_amp = settings.micro_jitter_px;
+    let jitter_hz = (settings.micro_jitter_hz * (1.0 + rng.gen_range(-0.2..0.2))).max(1.0);
+
+    for i in 0..=steps {
+        let raw_t = i as f32 / steps as f32;
+        let t = ease_in_out(raw_t);
+        let (mut x, mut y) = cubic_bezier(p0, p1, p2, p3, t);
+
+        let w = 2.0 * PI * jitter_hz * (i as f32 * (step_ms as f32 / 1000.0));
+        let jitter = w.sin() * jitter_amp + rng.gen_range(-jitter_amp..jitter_amp) * 0.25;
+
+        let tp = cubic_bezier(p0, p1, p2, p3, (t + 1.0/steps as f32).min(1.0));
+        let dx = tp.0 - x;
+        let dy = tp.1 - y;
+        let d = (dx*dx + dy*dy).sqrt().max(1.0);
+        let (nx, ny) = (-dy/d, dx/d);
+        x += nx * jitter;
+        y += ny * jitter;
+
+        let (mut xi, mut yi) = (x.round() as i32, y.round() as i32);
+        if let Some(b) = bounds {
+            if xi < b.min_x { xi = b.min_x; }
+            if xi > b.max_x { xi = b.max_x; }
+            if yi < b.min_y { yi = b.min_y; }
+            if yi > b.max_y { yi = b.max_y; }
+        }
+
+        enigo.mouse_move_to(xi, yi);
+
+        if let Some(pause_idx) = maybe_pause_at {
+            if i == pause_idx {
+                thread::sleep(Duration::from_millis(
+                    rng.gen_range(settings.min_pause_ms..=settings.max_pause_ms)
+                ));
+            }
+        }
+
+        thread::sleep(Duration::from_millis(step_ms));
+    }
+
+    enigo.mouse_down(button);
+    thread::sleep(Duration::from_millis(20 + rand::thread_rng().gen_range(0..50)));
+    enigo.mouse_up(button);
+}
 // -------------- Click Engine --------------
 #[derive(Clone, Copy, Debug)]
 enum ClickButton { Left, Right }
@@ -36,40 +184,69 @@ static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::
 
 impl ClickJob {
     fn spawn(config: Arc<Mutex<ClickConfig>>) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc};
+        use std::time::Duration;
+        use rand::Rng;
+        use enigo::{MouseButton};
+
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let config_clone = Arc::clone(&config);
 
         eprintln!("Starting click job with config: {:?}", config.lock());
 
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
+            let mut last_pos: Option<(i32,i32)> = None;
+
             loop {
                 if !running_clone.load(Ordering::Relaxed) { break; }
 
                 let cfg = config_clone.lock().clone();
                 let Some(b) = cfg.bounds else {
-                    // No bounds set; idle briefly
-                    thread::sleep(Duration::from_millis(200));
+                    std::thread::sleep(Duration::from_millis(200));
                     continue;
                 };
-                if !b.is_valid() { thread::sleep(Duration::from_millis(200)); continue; }
+                if !b.is_valid() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
 
-                // Pick random point
+                // pick random point inside box
                 let x = rng.gen_range(b.min_x..=b.max_x);
                 let y = rng.gen_range(b.min_y..=b.max_y);
 
-                // Move & click (absolute physical pixels)
+                // human-style move & click
                 {
                     let mut en = ENIGO.lock();
-                    en.mouse_move_to(x, y);
-                    match cfg.button {
-                        ClickButton::Left => en.mouse_click(MouseButton::Left),
-                        ClickButton::Right => en.mouse_click(MouseButton::Right),
-                    }
+
+                    // starting point: last known, or “outside the square” so we can test re-entry
+                    let from = last_pos.unwrap_or((b.min_x - 40, b.min_y - 40));
+
+                    // minimal rect adapter for the helper
+                    // map your ClickButton -> enigo::MouseButton
+                    let button = match cfg.button {
+                        ClickButton::Left => MouseButton::Left,
+                        ClickButton::Right => MouseButton::Right,
+                    };
+
+                    // run the human move & click
+                    human_move_and_click(
+                        &mut *en,
+                        from,
+                        (x, y),
+                        Some(Bounds { min_x: b.min_x, min_y: b.min_y, max_x: b.max_x, max_y: b.max_y }),
+                        &HumanMouseSettings::default(),
+                        button,
+                    );
                 }
 
-                // Sleep random between min..max (seconds)
+                // remember where we ended up
+                last_pos = Some((x, y));
+
+                // sleep random between min..max (seconds), while checking stop flag
                 let (min_s, max_s) = if cfg.min_secs <= cfg.max_secs {
                     (cfg.min_secs, cfg.max_secs)
                 } else { (cfg.max_secs, cfg.min_secs) };
@@ -77,15 +254,14 @@ impl ClickJob {
                 let ms = (wait * 1000.0) as u64;
                 for _ in 0..ms/50 {
                     if !running_clone.load(Ordering::Relaxed) { break; }
-                    thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                if ms % 50 != 0 { thread::sleep(Duration::from_millis(ms % 50)); }
+                if ms % 50 != 0 { std::thread::sleep(Duration::from_millis(ms % 50)); }
             }
         });
 
         Self { running, config }
     }
-
     fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
 }
 

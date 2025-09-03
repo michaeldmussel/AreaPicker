@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "area_clicker"
 version = "0.1.0"
 edition = "2021"
