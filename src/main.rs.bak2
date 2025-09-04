@@ -11,10 +11,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_resizable(false)
-            .with_transparent(true),
-        follow_system_theme: false,
-        default_theme: eframe::Theme::Dark,
+            .with_resizable(false),
         ..Default::default()
     };
     eframe::run_native(
@@ -156,7 +153,8 @@ impl AppState {
                             let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
                             let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
                             
-                            enigo.mouse_move_to(x, y);
+                            let (start_x, start_y) = enigo.mouse_location();
+                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
                             
                             let button = match action.button {
                                 ClickButton::Left => MouseButton::Left,
@@ -186,9 +184,10 @@ impl AppState {
                         let x = rng.gen_range(bounds.min_x..=bounds.max_x);
                         let y = rng.gen_range(bounds.min_y..=bounds.max_y);
                         
-                        enigo.mouse_move_to(x, y);
-                        
-                        let button = match cfg.button {
+                            let (start_x, start_y) = enigo.mouse_location();
+                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
+                            
+                            let button = match cfg.button {
                             ClickButton::Left => MouseButton::Left,
                             ClickButton::Right => MouseButton::Right,
                         };
@@ -277,53 +276,41 @@ impl eframe::App for AppState {
                 return;
             }
             
-            // Make the window background transparent
-            ctx.set_visuals(egui::Visuals {
-                window_fill: Color32::from_rgba_premultiplied(0, 0, 0, 0),
-                panel_fill: Color32::from_rgba_premultiplied(0, 0, 0, 0),
-                window_stroke: egui::Stroke::NONE,
-                ..Default::default()
-            });
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
             
-            // Clear any background
-            ctx.clear_animations();
-
             // Get the screen dimensions and create rect in absolute coordinates
             let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
             let screen_rect = egui::Rect::from_min_max(
                 Pos2::new(min_x as f32, min_y as f32),
                 Pos2::new(max_x as f32, max_y as f32)
             );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
 
-            egui::Window::new("picker_overlay")
-                .frame(egui::Frame::none())
-                .title_bar(false)
-                .resizable(false)
-                .fixed_pos((0.0, 0.0))
-                .fixed_size((screen_rect.width(), screen_rect.height()))
+            egui::Area::new(egui::Id::new("picker_area"))
+                .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    // Very light tint for the entire screen
-                    ui.painter().rect_filled(
-                        screen_rect,
-                        0.0,
-                        Color32::from_rgba_premultiplied(128, 128, 128, 20)
-                    );
-
-                    let response = ui.allocate_rect(screen_rect, Sense::click_and_drag());
-                    let absolute_pos = if let Some(pos) = response.hover_pos() {
-                        pos
+                    let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                    
+                    let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                        Pos2::new(pos.x, pos.y)
                     } else {
                         Pos2::new(0.0, 0.0)
                     };
                     
-                    if response.drag_started() {
+                    if resp.drag_started() {
                         self.drag_start = Some(absolute_pos);
                         self.drag_end = self.drag_start;
                     }
-                    if response.dragged() {
+                    if resp.dragged() {
                         self.drag_end = Some(absolute_pos);
                     }
-                    if response.drag_stopped() {
+                    if resp.drag_stopped() {
                         self.drag_end = Some(absolute_pos);
                         self.bounds_from_drag();
                         self.picking_area = false;
@@ -332,33 +319,13 @@ impl eframe::App for AppState {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
                         // Reset window size to default
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(800.0, 600.0)));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
                     }
 
-                    // Draw selection rectangle with a contrasting outline
                     if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
                         let rect = Rect::from_two_pos(a, b);
-                        
-                        // Fill with very light blue
-                        ui.painter().rect_filled(
-                            rect,
-                            0.0,
-                            Color32::from_rgba_premultiplied(100, 150, 255, 40)
-                        );
-                        
-                        // Draw a white border
-                        ui.painter().rect_stroke(
-                            rect,
-                            0.0,
-                            egui::Stroke { width: 1.0, color: Color32::WHITE }
-                        );
-                        
-                        // Draw a black outer border for contrast
-                        ui.painter().rect_stroke(
-                            rect.expand(1.0),
-                            0.0,
-                            egui::Stroke { width: 1.0, color: Color32::BLACK }
-                        );
+                        let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                        painter.rect_stroke(rect, 0.0, stroke);
                     }
                 });
 
@@ -392,77 +359,92 @@ impl eframe::App for AppState {
                 // Left column - Sequence management
                 cols[0].group(|ui| {
                     ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            let mut sequence_mode = sequence_mode;
-                            if ui.checkbox(&mut sequence_mode, "Enable Sequence Mode").changed() {
-                                self.config.lock().sequence_mode = sequence_mode;
-                            }
-                            if sequence_mode {
-                                if ui.button("➕ Add Step").clicked() {
-                                    self.current_sequence_index = self.config.lock().sequence.len();
-                                    self.editing_sequence = true;
-                                    self.bounds_inputs = [100, 400, 100, 400];
-                                    self.click_button_left = true;
-                                    self.min_secs = 1.0;
-                                    self.max_secs = 3.0;
-                                    self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
-                                    self.sequence_edit_clicks = 1;
-                                }
-                            }
-                        });
-
+                // Left column - Sequence management
+                cols[0].group(|ui| {
+                    ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let mut sequence_mode = sequence_mode;
+                        if ui.checkbox(&mut sequence_mode, "Enable Sequence Mode").changed() {
+                            self.config.lock().sequence_mode = sequence_mode;
+                        }
                         if sequence_mode {
-                            ui.separator();
-                            ui.heading("Sequence Steps");
-
-                            // List existing steps
-                            let mut to_remove = None;
-                            {
-                                let config = self.config.lock();
-                                for (i, action) in config.sequence.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        if ui.button(format!("Edit #{}", i + 1)).clicked() {
-                                            self.current_sequence_index = i;
-                                            self.editing_sequence = true;
-                                            self.bounds_inputs = [
-                                                action.bounds.min_x,
-                                                action.bounds.max_x,
-                                                action.bounds.min_y,
-                                                action.bounds.max_y
-                                            ];
-                                            self.click_button_left = matches!(action.button, ClickButton::Left);
-                                            self.min_secs = action.min_secs;
-                                            self.max_secs = action.max_secs;
-                                            self.sequence_edit_name = action.name.clone();
-                                            self.sequence_edit_clicks = action.clicks_per_cycle;
-                                        }
-
-                                        let mut enabled = action.enabled;
-                                        if ui.checkbox(&mut enabled, "").changed() {
-                                            self.config.lock().sequence[i].enabled = enabled;
-                                        }
-
-                                        ui.label(format!(
-                                            "{}: [{},{}]x[{},{}], {} clicks, {:.1}-{:.1}s",
-                                            action.name,
-                                            action.bounds.min_x, action.bounds.max_x,
-                                            action.bounds.min_y, action.bounds.max_y,
-                                            action.clicks_per_cycle,
-                                            action.min_secs, action.max_secs
-                                        ));
-
-                                        if ui.button("🗑").clicked() {
-                                            to_remove = Some(i);
-                                        }
-                                    });
-                                }
-                            }
-
-                            // Handle removal outside the iteration
-                            if let Some(i) = to_remove {
-                                self.config.lock().sequence.remove(i);
+                            if ui.button("➕ Add Step").clicked() {
+                                self.current_sequence_index = self.config.lock().sequence.len();
+                                self.editing_sequence = true;
+                                self.bounds_inputs = [100, 400, 100, 400];
+                                self.click_button_left = true;
+                                self.min_secs = 1.0;
+                                self.max_secs = 3.0;
+                                self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
+                                self.sequence_edit_clicks = 1;
                             }
                         }
+                    });
+
+                    if sequence_mode {
+                        ui.separator();
+                        ui.heading("Sequence Steps");
+                        
+                        // List existing steps
+                        let mut to_remove = None;
+                        {
+                            let config = self.config.lock();
+                            for (i, action) in config.sequence.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(format!("Edit #{}", i + 1)).clicked() {
+                                        self.current_sequence_index = i;
+                                        self.editing_sequence = true;
+                                        self.bounds_inputs = [
+                                            action.bounds.min_x,
+                                            action.bounds.max_x,
+                                            action.bounds.min_y,
+                                            action.bounds.max_y
+                                        ];
+                                        self.click_button_left = matches!(action.button, ClickButton::Left);
+                                        self.min_secs = action.min_secs;
+                                        self.max_secs = action.max_secs;
+                                        self.sequence_edit_name = action.name.clone();
+                                        self.sequence_edit_clicks = action.clicks_per_cycle;
+                                    }
+
+                                    let mut enabled = action.enabled;
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        self.config.lock().sequence[i].enabled = enabled;
+                                    }
+
+                                    ui.label(format!(
+                                        "{}: [{},{}]x[{},{}], {} clicks, {:.1}-{:.1}s",
+                                        action.name,
+                                        action.bounds.min_x, action.bounds.max_x,
+                                        action.bounds.min_y, action.bounds.max_y,
+                                        action.clicks_per_cycle,
+                                        action.min_secs, action.max_secs
+                                    ));
+
+                                    if ui.button("🗑").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                });
+                            }
+                        }
+
+                        // Handle removal outside the iteration
+                        if let Some(i) = to_remove {
+                            self.config.lock().sequence.remove(i);
+                        }
+
+                        // Add new step button
+                        if ui.button("Add New Step").clicked() {
+                            self.current_sequence_index = self.config.lock().sequence.len();
+                            self.editing_sequence = true;
+                            self.bounds_inputs = [100, 400, 100, 400];
+                            self.click_button_left = true;
+                            self.min_secs = 1.0;
+                            self.max_secs = 3.0;
+                            self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
+                            self.sequence_edit_clicks = 1;
+                        }
+                    }
                     });
                 });
 
@@ -500,6 +482,7 @@ impl eframe::App for AppState {
                         self.window_visible = true;
                     }
 
+                    ui.separator();
                     ui.separator();
                     ui.label("Click Settings:");
                     egui::Grid::new("click_settings").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -572,6 +555,20 @@ impl eframe::App for AppState {
                             }
                         });
                     }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Start").clicked() { self.start(); }
+                        if ui.button("Pause").clicked() { self.pause(); }
+                        if ui.button("Stop").clicked() { self.stop(); }
+                    });
+
+                    if let Some(job) = &self.job {
+                        let running = job.running.load(Ordering::Relaxed);
+                        ui.label(format!("Status: {}", if running { "Running" } else { "Stopped" }));
+                    } else {
+                        ui.label("Status: Stopped");
+                    }
+                });
 
                     // Preview rectangle
                     ui.separator();
