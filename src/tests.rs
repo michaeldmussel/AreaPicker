@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::human_mouse::Bounds;
     use std::time::Duration;
 
     #[test]
