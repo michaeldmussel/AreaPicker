@@ -4,7 +4,13 @@ use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
 use enigo::MouseControllable;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::s                    // Move mouse with human-like motion
+                    if let Some((last_x, last_y)) = last_pos {
+                        human_mouse::move_mouse_human(last_x, last_y, x, y);
+                    } else {
+                        // First move is direct
+                        enigo.mouse_move_to(x, y);
+                    }atomic::{AtomicBool, Ordering}, Arc};
 use crate::human_mouse::{HumanMouseSettings, Bounds, human_move_and_click};
 
 use clap::Parser;
@@ -41,7 +47,22 @@ struct ClickJob {
 }
 
 #[derive(Clone, Debug)]
+struct SequenceAction {
+    bounds: Bounds,
+    button: ClickButton,
+    min_secs: f32,
+    max_secs: f32,
+    clicks_per_cycle: u32,  // Number of clicks to perform in this region per sequence cycle
+}
+
+#[derive(Clone, Debug)]
 struct ClickConfig {
+    sequence_mode: bool,  // true if running a sequence, false for single region
+    sequence: Vec<SequenceAction>,  // Actions to perform in order
+    sequence_cycles: Option<u32>,  // None for infinite, Some(n) for n cycles
+    current_action: usize,  // Index of current action in sequence
+
+    // Legacy single-region config (used when sequence_mode is false)
     bounds: Option<Bounds>,
     button: ClickButton,
     min_secs: f32,
@@ -49,50 +70,123 @@ struct ClickConfig {
     finite_clicks: Option<u32>,  // None for infinite, Some(n) for n clicks
 }
 
+impl Default for ClickConfig {
+    fn default() -> Self {
+        Self {
+            sequence_mode: false,
+            sequence: Vec::new(),
+            sequence_cycles: None,
+            current_action: 0,
+            bounds: None,
+            button: ClickButton::Left,
+            min_secs: 0.075,
+            max_secs: 0.25,
+            finite_clicks: None,
+        }
+    }
+}
+
 static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::new()));
 
 impl ClickJob {
     fn spawn(config: Arc<Mutex<ClickConfig>>) -> Self {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-        use std::sync::{Arc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use std::time::Duration;
         use rand::Rng;
-        use enigo::{MouseButton};
+        use enigo::MouseButton;
 
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
         let config_clone = Arc::clone(&config);
 
-        eprintln!("Starting click job with config: {:?}", config.lock());
+        eprintln!("Starting click job with config: {:#?}", config.lock());
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
             let mut last_pos: Option<(i32,i32)> = None;
+            
+            // For sequence mode tracking
+            let mut current_action_clicks: u32 = 0;
+            let mut cycles_completed: u32 = 0;
+            
+            // For legacy single-region mode
             let mut clicks_remaining = config_clone.lock().finite_clicks;
 
-            loop {
-                if !running_clone.load(Ordering::Relaxed) { break; }
+            while running_clone.load(Ordering::Relaxed) {
+                let config = config_clone.lock();
+                let mut enigo = enigo::Enigo::new();
+
+                // Check if we should continue based on finite clicks setting
+                if let Some(clicks) = clicks_remaining {
+                    if clicks == 0 {
+                        break;
+                    }
+                }
                 
-                // Check if we've completed our finite clicks
-                if let Some(0) = clicks_remaining {
-                    running_clone.store(false, Ordering::Relaxed);
-                    break;
-                }
+                if config.sequence_mode {
+                    // Get current action
+                    if let Some(ref actions) = &config.sequence_actions {
+                        if actions.is_empty() {
+                            drop(config);
+                            std::thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
 
-                let cfg = config_clone.lock().clone();
-                let Some(b) = cfg.bounds else {
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
-                };
-                if !b.is_valid() {
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
+                        let current_action_idx = config.current_action_index as usize % actions.len();
+                        let action = &actions[current_action_idx];
+                        
+                        // Check if we need to move to next action
+                        if current_action_clicks >= action.num_clicks {
+                            current_action_clicks = 0;
+                            
+                            // Update cycle count if we're at the end of sequence
+                            if current_action_idx == actions.len() - 1 {
+                                cycles_completed += 1;
+                                
+                                // Check cycle limit
+                                if let Some(max_cycles) = config.max_cycles {
+                                    if cycles_completed >= max_cycles {
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            continue;
+                        }
 
-                // pick random point inside box
-                let x = rng.gen_range(b.min_x..=b.max_x);
-                let y = rng.gen_range(b.min_y..=b.max_y);
+                        // Get random point within current action's bounds
+                        let x = rng.gen_range(action.bounds.left..=action.bounds.right);
+                        let y = rng.gen_range(action.bounds.top..=action.bounds.bottom);
+                        
+                        // Move mouse with human-like motion
+                        if let Some((last_x, last_y)) = last_pos {
+                            human_mouse::move_mouse_human(last_x, last_y, x, y);
+                        } else {
+                            // First move is direct
+                            enigo.mouse_move_to(x, y);
+                        }
+                        last_pos = Some((x, y));
+                        
+                        // Click
+                        enigo.mouse_click(MouseButton::Left);
+                        current_action_clicks += 1;
+
+                        // Random delay based on action's interval settings
+                        let delay = rng.gen_range(action.min_interval..=action.max_interval);
+                        std::thread::sleep(Duration::from_millis(delay));
+                    }
+                } else {
+                    // Legacy single-region mode
+                    if !config.bounds.is_valid() {
+                        drop(config);
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+
+                    // Get random point within bounds
+                    let x = rng.gen_range(config.bounds.left..=config.bounds.right);
+                    let y = rng.gen_range(config.bounds.top..=config.bounds.bottom);
 
                 // human-style move & click
                 {
@@ -101,22 +195,10 @@ impl ClickJob {
                     // starting point: last known, or “outside the square” so we can test re-entry
                     let from = last_pos.unwrap_or((b.min_x - 40, b.min_y - 40));
 
-                    // minimal rect adapter for the helper
-                    // map your ClickButton -> enigo::MouseButton
-                    let button = match cfg.button {
-                        ClickButton::Left => MouseButton::Left,
-                        ClickButton::Right => MouseButton::Right,
-                    };
+                    last_pos = Some((x, y));
 
-                    // run the human move & click
-                    human_move_and_click(
-                        &mut *en,
-                        from,
-                        (x, y),
-                        Some(Bounds { min_x: b.min_x, min_y: b.min_y, max_x: b.max_x, max_y: b.max_y }),
-                        &HumanMouseSettings::default(),
-                        button,
-                    );
+                    // Click
+                    enigo.mouse_click(MouseButton::Left);
                 }
 
                 // remember where we ended up
@@ -127,20 +209,13 @@ impl ClickJob {
                     *remaining = remaining.saturating_sub(1);
                 }
 
-                // sleep random between min..max (seconds), while checking stop flag
-                let (min_s, max_s) = if cfg.min_secs <= cfg.max_secs {
-                    (cfg.min_secs, cfg.max_secs)
-                } else { (cfg.max_secs, cfg.min_secs) };
-                let wait = rng.gen_range(min_s..=max_s).max(0.01);
-                let ms = (wait * 1000.0) as u64;
-                for _ in 0..ms/50 {
-                    if !running_clone.load(Ordering::Relaxed) { break; }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if ms % 50 != 0 { std::thread::sleep(Duration::from_millis(ms % 50)); }
+                    // Random delay based on interval settings
+                    let delay = rng.gen_range(config.min_interval..=config.max_interval);
+                    std::thread::sleep(Duration::from_millis(delay));
             }
         });
 
+        let _ = handle; // Detach the thread
         Self { running, config }
     }
     fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
@@ -229,13 +304,20 @@ struct AppState {
     monitors: Vec<Monitor>,
     display_choice: DisplayChoice,
 
-    // Config inputs
+    // Config inputs - Single region mode
     bounds_inputs: [i32; 4], // min_x, max_x, min_y, max_y
     click_button_left: bool,
     min_secs: f32,
     max_secs: f32,
     use_finite_clicks: bool,
     num_clicks: u32,
+
+    // Sequence mode
+    sequence_enabled: bool,
+    sequence_cycles: Option<u32>,  // None for infinite
+    sequence_editing_idx: Option<usize>,  // Index of action being edited, None when not editing
+    sequence_action_clicks: u32,  // Number of clicks for the current action being edited
+    sequence_actions: Vec<SequenceAction>,
 
     // Engine
     job: Option<ClickJob>,
@@ -260,6 +342,13 @@ impl Default for AppState {
             use_finite_clicks: false,
             num_clicks: 100,
 
+            // Sequence mode defaults
+            sequence_enabled: false,
+            sequence_cycles: Some(1),
+            sequence_editing_idx: None,
+            sequence_action_clicks: 1,
+            sequence_actions: Vec::new(),
+
             job: None,
             config: Arc::new(Mutex::new(ClickConfig{
                 bounds: Some(Bounds{min_x:100, max_x:400, min_y:100, max_y:400}),
@@ -276,16 +365,30 @@ impl AppState {
     fn start(&mut self) {
         if self.job.is_some() { return; }
         let mut cfg = self.config.lock();
-        cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
-        cfg.min_secs = self.min_secs;
-        cfg.max_secs = self.max_secs;
-        cfg.finite_clicks = if self.use_finite_clicks { Some(self.num_clicks) } else { None };
-        cfg.bounds = Some(Bounds{
-            min_x: self.bounds_inputs[0],
-            max_x: self.bounds_inputs[1],
-            min_y: self.bounds_inputs[2],
-            max_y: self.bounds_inputs[3],
-        });
+
+        if self.sequence_enabled && !self.sequence_actions.is_empty() {
+            // Sequence mode
+            cfg.sequence_mode = true;
+            cfg.sequence = self.sequence_actions.clone();
+            cfg.sequence_cycles = self.sequence_cycles;
+            cfg.current_action = 0;
+            cfg.finite_clicks = None; // Not used in sequence mode
+            cfg.bounds = None; // Not used in sequence mode
+        } else {
+            // Single region mode
+            cfg.sequence_mode = false;
+            cfg.sequence.clear();
+            cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
+            cfg.min_secs = self.min_secs;
+            cfg.max_secs = self.max_secs;
+            cfg.finite_clicks = if self.use_finite_clicks { Some(self.num_clicks) } else { None };
+            cfg.bounds = Some(Bounds{
+                min_x: self.bounds_inputs[0],
+                max_x: self.bounds_inputs[1],
+                min_y: self.bounds_inputs[2],
+                max_y: self.bounds_inputs[3],
+            });
+        }
         drop(cfg);
         self.job = Some(ClickJob::spawn(Arc::clone(&self.config)));
     }
@@ -435,6 +538,116 @@ impl eframe::App for AppState {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.checkbox(&mut self.sequence_enabled, "Enable Sequence Mode");
+            ui.separator();
+
+            if self.sequence_enabled {
+                // Sequence Mode UI
+                ui.horizontal(|ui| {
+                    ui.label("Sequence Cycles:");
+                    if ui.radio_value(&mut self.sequence_cycles, None, "Infinite").clicked() {
+                        self.sequence_cycles = None;
+                    }
+                    if ui.radio_value(&mut self.sequence_cycles, Some(self.sequence_cycles.unwrap_or(1)), "Fixed").clicked() {
+                        self.sequence_cycles = Some(1);
+                    }
+                    if let Some(cycles) = &mut self.sequence_cycles {
+                        ui.add(egui::DragValue::new(cycles).speed(1).clamp_range(1..=10000));
+                    }
+                });
+
+                ui.separator();
+                ui.heading("Sequence Actions");
+                
+                for (i, action) in self.sequence_actions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}. Region: [{}, {}]×[{}, {}]", 
+                            i + 1,
+                            action.bounds.min_x, action.bounds.max_x,
+                            action.bounds.min_y, action.bounds.max_y,
+                        ));
+                        ui.label(format!("Clicks: {}", action.clicks_per_cycle));
+                        ui.label(format!("Interval: {:.1}s-{:.1}s", action.min_secs, action.max_secs));
+                        if ui.button("Edit").clicked() {
+                            self.sequence_editing_idx = Some(i);
+                            self.bounds_inputs = [
+                                action.bounds.min_x, action.bounds.max_x,
+                                action.bounds.min_y, action.bounds.max_y
+                            ];
+                            self.min_secs = action.min_secs;
+                            self.max_secs = action.max_secs;
+                            self.sequence_action_clicks = action.clicks_per_cycle;
+                        }
+                        if ui.button("Remove").clicked() {
+                            if Some(i) == self.sequence_editing_idx {
+                                self.sequence_editing_idx = None;
+                            }
+                            self.sequence_actions.remove(i);
+                        }
+                    });
+                }
+
+                ui.group(|ui| {
+                    if let Some(editing_idx) = self.sequence_editing_idx {
+                        ui.label("Edit Action");
+                    } else {
+                        ui.label("New Action");
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Clicks per cycle:");
+                        ui.add(egui::DragValue::new(&mut self.sequence_action_clicks).speed(1).clamp_range(1..=1000));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Interval (seconds):");
+                        ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
+                        ui.label("to");
+                        ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Pick Area").clicked() {
+                            self.drag_start = None;
+                            self.drag_end = None;
+                            self.picking_area = true;
+                            self.window_visible = true;
+                        }
+
+                        if ui.button("Save Action").clicked() {
+                            let action = SequenceAction {
+                                bounds: Bounds {
+                                    min_x: self.bounds_inputs[0],
+                                    max_x: self.bounds_inputs[1],
+                                    min_y: self.bounds_inputs[2],
+                                    max_y: self.bounds_inputs[3],
+                                },
+                                button: if self.click_button_left { ClickButton::Left } else { ClickButton::Right },
+                                min_secs: self.min_secs,
+                                max_secs: self.max_secs,
+                                clicks_per_cycle: self.sequence_action_clicks,
+                            };
+
+                            if let Some(idx) = self.sequence_editing_idx {
+                                // Update existing action
+                                self.sequence_actions[idx] = action;
+                                self.sequence_editing_idx = None;
+                            } else {
+                                // Add new action
+                                self.sequence_actions.push(action);
+                            }
+                        }
+
+                        if let Some(_) = self.sequence_editing_idx {
+                            if ui.button("Cancel Edit").clicked() {
+                                self.sequence_editing_idx = None;
+                            }
+                        }
+                    });
+                });
+            }
+
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.group(|ui| {
@@ -502,7 +715,25 @@ impl eframe::App for AppState {
 
                         if let Some(job) = &self.job {
                             let running = job.running.load(Ordering::Relaxed);
-                            ui.label(format!("Status: {}", if running {"Running"} else {"Stopped"}));
+                            if running {
+                                let cfg = self.config.lock();
+                                if cfg.sequence_mode {
+                                    ui.label(format!(
+                                        "Status: Running sequence ({} actions, current: {})", 
+                                        cfg.sequence.len(),
+                                        cfg.current_action + 1
+                                    ));
+                                    if let Some(cycles) = cfg.sequence_cycles {
+                                        ui.label(format!("Cycles remaining: {}", cycles));
+                                    } else {
+                                        ui.label("Cycles: Infinite");
+                                    }
+                                } else {
+                                    ui.label("Status: Running (single region)");
+                                }
+                            } else {
+                                ui.label("Status: Stopped");
+                            }
                         } else {
                             ui.label("Status: Stopped");
                         }
@@ -510,8 +741,29 @@ impl eframe::App for AppState {
                 });
             });
 
-            // Preview rectangle
-            if let Some(b) = self.config.lock().bounds {
+            // Preview regions
+            let cfg = self.config.lock();
+            if cfg.sequence_mode {
+                // Preview all sequence regions
+                for (i, action) in cfg.sequence.iter().enumerate() {
+                    let b = &action.bounds;
+                    let color = if Some(i) == self.sequence_editing_idx {
+                        Color32::LIGHT_BLUE
+                    } else if i == cfg.current_action && self.job.is_some() {
+                        Color32::LIGHT_GREEN
+                    } else {
+                        Color32::GRAY
+                    };
+                    ui.painter().rect_stroke(
+                        Rect::from_min_max(
+                            Pos2::new(b.min_x as f32, b.min_y as f32),
+                            Pos2::new(b.max_x as f32, b.max_y as f32)
+                        ),
+                        0.0,
+                        egui::Stroke { width: 2.0, color }
+                    );
+                }
+            } else if let Some(b) = cfg.bounds {
                 let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})",
                                    b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
                 ui.separator();
