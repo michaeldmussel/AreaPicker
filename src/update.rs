@@ -1,264 +1,8 @@
-mod human_mouse;
-
-use eframe::{egui, egui::{Color32, Pos2, Rect, Sense}};
-use enigo::{self, MouseButton, MouseControllable};
-use parking_lot::Mutex;
-use rand::Rng;
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
-
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 380.0])
-            .with_min_inner_size([520.0, 380.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Area Clicker",
-        options,
-        Box::new(|cc| Box::new(AppState::new(cc)))
-    )
-}
-
-// -------------- Click Engine --------------
-#[derive(Clone, Copy, Debug)]
-enum ClickButton { Left, Right }
-
-#[derive(Clone, Copy, Debug)]
-struct Bounds { min_x: i32, max_x: i32, min_y: i32, max_y: i32 }
-
-impl Bounds {
-    fn width(&self) -> i32 { self.max_x - self.min_x }
-    fn height(&self) -> i32 { self.max_y - self.min_y }
-    fn is_valid(&self) -> bool { self.width() > 0 && self.height() > 0 }
-}
-
-struct ClickJob {
-    running: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-    config: Arc<Mutex<ClickConfig>>,
-}
-
-#[derive(Clone, Debug)]
-struct SequenceAction {
-    bounds: Bounds,
-    button: ClickButton,
-    min_secs: f32,
-    max_secs: f32,
-    clicks_per_cycle: i32,
-    name: String,
-    enabled: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ClickConfig {
-    bounds: Option<Bounds>,
-    button: ClickButton,
-    min_secs: f32,
-    max_secs: f32,
-    sequence_mode: bool,
-    sequence: Vec<SequenceAction>,
-}
-
-// -------------- App State --------------
-struct AppState {
-    config: Arc<Mutex<ClickConfig>>,
-    job: Option<ClickJob>,
-    
-    // UI State
-    bounds_inputs: [i32; 4],
-    click_button_left: bool,
-    min_secs: f32,
-    max_secs: f32,
-    finite_clicks: Option<i32>,
-    sequence_cycles: Option<i32>,
-    
-    // Area picking state
-    picking_area: bool,
-    window_visible: bool,
-    drag_start: Option<Pos2>,
-    drag_end: Option<Pos2>,
-
-    // Sequence editing state
-    editing_sequence: bool,
-    current_sequence_index: usize,
-    sequence_edit_name: String,
-    sequence_edit_clicks: i32,
-}
-
-impl AppState {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            config: Arc::new(Mutex::new(ClickConfig {
-                bounds: None,
-                button: ClickButton::Left,
-                min_secs: 1.0,
-                max_secs: 3.0,
-                sequence_mode: false,
-                sequence: Vec::new(),
-            })),
-            job: None,
-            bounds_inputs: [100, 400, 100, 400],
-            click_button_left: true,
-            min_secs: 1.0,
-            max_secs: 3.0,
-            finite_clicks: None,
-            sequence_cycles: None,
-            picking_area: false,
-            window_visible: true,
-            drag_start: None,
-            drag_end: None,
-            editing_sequence: false,
-            current_sequence_index: 0,
-            sequence_edit_name: String::new(),
-            sequence_edit_clicks: 1,
-        }
-    }
-
-    fn start(&mut self) {
-        if self.job.is_some() {
-            return;
-        }
-
-        let config = self.config.clone();
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
-        
-        let finite_clicks = self.finite_clicks;
-        let sequence_cycles = self.sequence_cycles;
-
-        let handle = thread::spawn(move || {
-            let mut enigo = enigo::Enigo::new();
-            let mut rng = rand::thread_rng();
-            let mut clicks_left = finite_clicks;
-            let mut cycles_left = sequence_cycles;
-            
-            'outer: while running_clone.load(Ordering::Relaxed) {
-                let cfg = config.lock();
-                
-                if cfg.sequence_mode {
-                    // Sequence mode - go through each enabled action
-                    if cfg.sequence.is_empty() {
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    
-                    for action in cfg.sequence.iter().filter(|a| a.enabled) {
-                        if !running_clone.load(Ordering::Relaxed) {
-                            break 'outer;
-                        }
-                        
-                        for _ in 0..action.clicks_per_cycle {
-                            let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
-                            let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
-                            
-                            let (start_x, start_y) = enigo.mouse_location();
-                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
-                            
-                            let button = match action.button {
-                                ClickButton::Left => MouseButton::Left,
-                                ClickButton::Right => MouseButton::Right,
-                            };
-                            enigo.mouse_click(button);
-                            
-                            let delay = rng.gen_range(action.min_secs..=action.max_secs);
-                            thread::sleep(Duration::from_secs_f32(delay));
-                        }
-                    }
-                    
-                    if let Some(cycles) = &mut cycles_left {
-                        *cycles -= 1;
-                        if *cycles <= 0 {
-                            break;
-                        }
-                    }
-                } else {
-                    // Single area mode
-                    if let Some(bounds) = cfg.bounds {
-                        if !bounds.is_valid() {
-                            thread::sleep(Duration::from_millis(100));
-                            continue;
-                        }
-
-                        let x = rng.gen_range(bounds.min_x..=bounds.max_x);
-                        let y = rng.gen_range(bounds.min_y..=bounds.max_y);
-                        
-                            let (start_x, start_y) = enigo.mouse_location();
-                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
-                            
-                            let button = match cfg.button {
-                            ClickButton::Left => MouseButton::Left,
-                            ClickButton::Right => MouseButton::Right,
-                        };
-                        enigo.mouse_click(button);
-                        
-                        if let Some(clicks) = &mut clicks_left {
-                            *clicks -= 1;
-                            if *clicks <= 0 {
-                                break;
-                            }
-                        }
-
-                        let delay = rng.gen_range(cfg.min_secs..=cfg.max_secs);
-                        thread::sleep(Duration::from_secs_f32(delay));
-                    }
-                }
-            }
-        });
-
-        self.job = Some(ClickJob {
-            running,
-            handle: Some(handle),
-            config: self.config.clone(),
-        });
-    }
-
-    fn stop(&mut self) {
-        if let Some(job) = self.job.take() {
-            job.running.store(false, Ordering::Relaxed);
-            if let Some(handle) = job.handle {
-                handle.join().ok();
-            }
-        }
-    }
-
-    fn pause(&mut self) {
-        if let Some(ref job) = self.job {
-            job.running.store(false, Ordering::Relaxed);
-        }
-    }
-
-    fn bounds_from_drag(&mut self) {
-        if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
-            self.bounds_inputs = [
-                start.x.min(end.x) as i32,
-                start.x.max(end.x) as i32,
-                start.y.min(end.y) as i32,
-                start.y.max(end.y) as i32,
-            ];
-            
-            // In single area mode, update the config bounds directly
-            if !self.config.lock().sequence_mode {
-                self.config.lock().bounds = Some(Bounds {
-                    min_x: self.bounds_inputs[0],
-                    max_x: self.bounds_inputs[1],
-                    min_y: self.bounds_inputs[2],
-                    max_y: self.bounds_inputs[3],
-                });
-            }
-        }
-    }
-
-    fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
-        // TODO: Add multi-monitor support. For now, we'll just use primary
-        (0, 0, 1920, 1080)
-    }
-}
-
-impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.picking_area {
+            // When in picking mode, make window fullscreen and translucent
             if self.window_visible {
+                self.window_visible = false;
                 // Get screen dimensions
                 let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
                 let width = max_x - min_x;
@@ -271,7 +15,6 @@ impl eframe::App for AppState {
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                self.window_visible = false;
                 return;
             }
             
@@ -291,42 +34,42 @@ impl eframe::App for AppState {
             
             painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
 
-            egui::Area::new(egui::Id::new("picker_area"))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
-                    
-                    let absolute_pos = if let Some(pos) = resp.hover_pos() {
-                        Pos2::new(pos.x, pos.y)
-                    } else {
-                        Pos2::new(0.0, 0.0)
-                    };
-                    
-                    if resp.drag_started() {
-                        self.drag_start = Some(absolute_pos);
-                        self.drag_end = self.drag_start;
-                    }
-                    if resp.dragged() {
-                        self.drag_end = Some(absolute_pos);
-                    }
-                    if resp.drag_stopped() {
-                        self.drag_end = Some(absolute_pos);
-                        self.bounds_from_drag();
-                        self.picking_area = false;
-                        // Restore window to normal state
-                        self.window_visible = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-                        // Reset window size to default
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
-                    }
+            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
+                let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                
+                // Get absolute screen coordinates using winit
+                let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                    // Use raw cursor position directly
+                    Pos2::new(pos.x, pos.y)
+                } else {
+                    Pos2::new(0.0, 0.0)
+                };
+                
+                if resp.drag_started() {
+                    self.drag_start = Some(absolute_pos);
+                    self.drag_end = self.drag_start;
+                }
+                if resp.dragged() {
+                    self.drag_end = Some(absolute_pos);
+                }
+                if resp.drag_stopped() {
+                    self.drag_end = Some(absolute_pos);
+                    self.bounds_from_drag();
+                    self.picking_area = false;
+                    // Restore window to normal state
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    // Reset window size to default
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
+                }
 
-                    if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
-                        let rect = Rect::from_two_pos(a, b);
-                        let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
-                        painter.rect_stroke(rect, 0.0, stroke);
-                    }
-                });
+                if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                    let rect = Rect::from_two_pos(a, b);
+                    let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            });
 
             ctx.request_repaint();
             return;
@@ -432,7 +175,7 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
                     ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
 
-                    if ui.button("Pick Area (drag a rectangle)").clicked() {
+                    if ui.button("Pick Area (drag a rectangle)").clicked() { 
                         self.drag_start = None;
                         self.drag_end = None;
                         self.picking_area = true;
@@ -461,7 +204,7 @@ impl eframe::App for AppState {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Clicks per cycle:");
-                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).clamp_range(1..=1000));
+                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).min(1));
                         });
                         
                         if ui.button("Save Step").clicked() {
@@ -536,4 +279,3 @@ impl eframe::App for AppState {
             }
         });
     }
-}

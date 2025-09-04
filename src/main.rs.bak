@@ -1,0 +1,1380 @@
+mod human_mouse;
+
+use eframe::{egui, egui::{Color32, Pos2, Rect, Sense}};
+use enigo::{self, MouseButton, MouseControllable};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use rand::Rng;
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
+
+// -------------- Click Engine --------------
+#[derive(Clone, Copy, Debug)]
+enum ClickButton { Left, Right }
+
+#[derive(Clone, Copy, Debug)]
+struct Bounds { min_x: i32, max_x: i32, min_y: i32, max_y: i32 }
+
+impl Bounds {
+    fn width(&self) -> i32 { self.max_x - self.min_x }
+    fn height(&self) -> i32 { self.max_y - self.min_y }
+    fn is_valid(&self) -> bool { self.width() > 0 && self.height() > 0 }
+}
+
+struct ClickJob {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    config: Arc<Mutex<ClickConfig>>,
+}
+
+#[derive(Clone, Debug)]
+struct SequenceAction {
+    bounds: Bounds,
+    button: ClickButton,
+    min_secs: f32,
+    max_secs: f32,
+    clicks_per_cycle: u32,  // Number of clicks to perform in this region per sequence cycle
+    name: String,          // Name/description of the action
+    enabled: bool         // Whether this action is enabled in the sequence
+    name: String,          // Name/description of the action
+    enabled: bool         // Whether this action is enabled in the sequence
+    name: String,           // Optional name/description for the action
+    enabled: bool,         // Whether this action is currently enabled in the sequence
+}
+
+#[derive(Clone, Debug)]
+struct ClickConfig {
+    sequence_mode: bool,  // true if running a sequence, false for single region
+    sequence: Vec<SequenceAction>,  // Actions to perform in order
+    sequence_cycles: Option<u32>,  // None for infinite, Some(n) for n cycles
+    current_action: usize,  // Index of current action in sequence
+
+    // Legacy single-region config (used when sequence_mode is false)
+    bounds: Option<Bounds>,
+    button: ClickButton,
+    min_secs: f32,
+    max_secs: f32,
+    finite_clicks: Option<u32>,  // None for infinite, Some(n) for n clicks
+
+    // UI state for sequence editing
+    sequence_edit_name: String,
+    sequence_edit_clicks: u32,
+}
+
+impl ClickJob {
+    fn spawn(config: Arc<Mutex<ClickConfig>>) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        let config_clone = Arc::clone(&config);
+
+        eprintln!("Starting click job with config: {:#?}", config.lock());
+
+        let handle = thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut last_pos: Option<(i32,i32)> = None;
+            
+            // For sequence mode tracking
+            let mut current_action_clicks: u32 = 0;
+            let mut cycles_completed: u32 = 0;
+            
+            // For legacy single-region mode
+            let mut clicks_remaining = config_clone.lock().finite_clicks;
+
+                while running_clone.load(Ordering::Relaxed) {
+                let mut config = config_clone.lock();
+                let mut enigo = enigo::Enigo::new();                // Check if we should continue based on finite clicks setting
+                if let Some(clicks) = clicks_remaining {
+                    if clicks == 0 {
+                        break;
+                    }
+                }
+                
+                if config.sequence_mode {
+                    // Get current action
+                    if config.sequence.is_empty() {
+                        drop(config);
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+
+                    // Skip disabled actions
+                    while !config.sequence[config.current_action].enabled {
+                        config.current_action = (config.current_action + 1) % config.sequence.len();
+                    }
+                    
+                    let action = &config.sequence[config.current_action];
+                    
+                    // Check if we need to move to next action
+                    if current_action_clicks >= action.clicks_per_cycle {
+                        current_action_clicks = 0;
+                        
+                        // Update cycle count if we're at the end of sequence
+                        if config.current_action == config.sequence.len() - 1 {
+                            cycles_completed += 1;
+                            
+                            // Check cycle limit
+                            if let Some(max_cycles) = config.sequence_cycles {
+                                if cycles_completed >= max_cycles {
+                                    break;
+                                }
+                            }
+                            
+                            config.current_action = 0;
+                        } else {
+                            config.current_action += 1;
+                        }
+                        
+                        continue;
+                    }
+
+                    // Get random point within current action's bounds
+                    let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
+                    let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
+
+                    // Move mouse with human-like motion
+                    if let Some((last_x, last_y)) = last_pos {
+                        enigo.mouse_move_to(last_x, last_y); // Move to start position
+                        human_mouse::move_mouse_human(&mut enigo, last_x, last_y, x, y);
+                    } else {
+                        // First move is direct
+                        enigo.mouse_move_to(x, y);
+                    }
+                    last_pos = Some((x, y));
+                    
+                    // Click
+                    enigo.mouse_click(match action.button {
+                        ClickButton::Left => MouseButton::Left,
+                        ClickButton::Right => MouseButton::Right,
+                    });
+                    current_action_clicks += 1;
+
+                    // Random delay based on action's interval settings
+                    let min_ms = (action.min_secs * 1000.0) as u64;
+                    let max_ms = (action.max_secs * 1000.0) as u64;
+                    let delay = rng.gen_range(min_ms..=max_ms);
+                    std::thread::sleep(Duration::from_millis(delay));
+                } else {
+                    // Legacy single-region mode
+                    if let Some(bounds) = config.bounds {
+                        // Get random point within bounds
+                        let x = rng.gen_range(bounds.min_x..=bounds.max_x);
+                        let y = rng.gen_range(bounds.min_y..=bounds.max_y);
+
+                        // Move mouse with human-like motion 
+                        if let Some((last_x, last_y)) = last_pos {
+                            enigo.mouse_move_to(last_x, last_y); // Move to start position
+                            human_mouse::move_mouse_human(&mut enigo, last_x, last_y, x, y);
+                        } else {
+                            // First move is direct
+                            enigo.mouse_move_to(x, y);
+                        }
+                        last_pos = Some((x, y));
+
+                        // Click
+                        enigo.mouse_click(match config.button {
+                            ClickButton::Left => MouseButton::Left,
+                            ClickButton::Right => MouseButton::Right,
+                        });
+
+                        // Decrement remaining clicks if finite
+                        if let Some(ref mut clicks) = clicks_remaining {
+                            *clicks -= 1;
+                        }
+
+                        // Random delay
+                        let min_ms = (config.min_secs * 1000.0) as u64;
+                        let max_ms = (config.max_secs * 1000.0) as u64;
+                        let delay = rng.gen_range(min_ms..=max_ms);
+                        std::thread::sleep(Duration::from_millis(delay));
+                    }
+                }
+            }
+        });
+
+        Self {
+            running,
+            config,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
+}
+
+// -------------- UI State --------------
+// Store screen bounds information
+static SCREEN_BOUNDS: Lazy<(i32, i32, i32, i32)> = Lazy::new(|| {
+    let en = enigo::Enigo::new();
+    let (w, h) = en.main_display_size();
+    (0, 0, w as i32, h as i32)
+});
+
+struct AppState {
+    picking_area: bool,
+    drag_start: Option<Pos2>,
+    drag_end: Option<Pos2>,
+    window_visible: bool,
+
+    bounds_inputs: [i32; 4], // min_x, max_x, min_y, max_y
+    click_button_left: bool,
+    min_secs: f32,
+    max_secs: f32,
+    finite_clicks: Option<u32>,
+    sequence_cycles: Option<u32>,
+
+    // Current area being configured
+    current_sequence_index: usize,
+    editing_sequence: bool,
+
+    job: Option<ClickJob>,
+    config: Arc<Mutex<ClickConfig>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            picking_area: false,
+            drag_start: None,
+            drag_end: None,
+            window_visible: true,
+
+            bounds_inputs: [100, 400, 100, 400],
+            click_button_left: true,
+            min_secs: 1.0,
+            max_secs: 3.0,
+            sequence_edit_name: "Step 1".to_string(),
+            sequence_edit_clicks: 1,
+            current_sequence_index: 0,
+            editing_sequence: false,
+            finite_clicks: None,
+            sequence_cycles: None,
+            current_sequence_index: 0,
+            editing_sequence: false,
+            sequence_edit_name: "Step 1".to_string(),
+            sequence_edit_clicks: 1,
+
+            job: None,
+            config: Arc::new(Mutex::new(ClickConfig{
+                bounds: Some(Bounds{min_x:100, max_x:400, min_y:100, max_y:400}),
+                button: ClickButton::Left,
+                min_secs: 1.0,
+                max_secs: 3.0,
+                sequence_mode: false,
+                sequence: Vec::new(),
+                sequence_cycles: None,
+                current_action: 0,
+                finite_clicks: None,
+            })),
+        }
+    }
+}
+
+impl AppState {
+    fn start(&mut self) {
+        if self.job.is_some() { return; }
+        // sync current config
+        let mut cfg = self.config.lock();
+        cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
+        cfg.min_secs = self.min_secs;
+        cfg.max_secs = self.max_secs;
+        cfg.bounds = Some(Bounds{
+            min_x: self.bounds_inputs[0],
+            max_x: self.bounds_inputs[1],
+            min_y: self.bounds_inputs[2],
+            max_y: self.bounds_inputs[3],
+        });
+        cfg.finite_clicks = self.finite_clicks;
+        cfg.sequence_cycles = self.sequence_cycles;
+        drop(cfg);
+        self.job = Some(ClickJob::spawn(Arc::clone(&self.config)));
+    }
+
+    fn stop(&mut self) {
+        if let Some(job) = &self.job { job.stop(); }
+        self.job = None;
+    }
+
+    fn pause(&mut self) {
+        if let Some(job) = &self.job { job.stop(); }
+        self.job = None;
+    }
+
+    fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
+        *SCREEN_BOUNDS
+    }
+
+    fn bounds_from_drag(&mut self) {
+        if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+            // Use raw screen coordinates directly
+            let raw_min_x = a.x.round() as i32;
+            let raw_max_x = b.x.round() as i32;
+            let raw_min_y = a.y.round() as i32;
+            let raw_max_y = b.y.round() as i32;
+            
+            // Ensure min/max are in correct order
+            let min_x = raw_min_x.min(raw_max_x);
+            let max_x = raw_min_x.max(raw_max_x);
+            let min_y = raw_min_y.min(raw_max_y);
+            let max_y = raw_min_y.max(raw_max_y);
+            
+            self.bounds_inputs = [min_x, max_x, min_y, max_y];
+            self.config.lock().bounds = Some(Bounds{min_x, max_x, min_y, max_y});
+            
+            eprintln!("Selected bounds: x=[{}..{}], y=[{}..{}]", min_x, max_x, min_y, max_y);
+        }
+    }
+}
+
+impl eframe::App for AppState {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.picking_area {
+            if self.window_visible {
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                self.window_visible = false;
+                return;
+            }
+            
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
+            
+            // Get the screen dimensions and create rect in absolute coordinates
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let screen_rect = egui::Rect::from_min_max(
+                Pos2::new(min_x as f32, min_y as f32),
+                Pos2::new(max_x as f32, max_y as f32)
+            );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
+
+            egui::Area::new(egui::Id::new("picker_area"))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                    
+                    let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                        Pos2::new(pos.x, pos.y)
+                    } else {
+                        Pos2::new(0.0, 0.0)
+                    };
+                    
+                    if resp.drag_started() {
+                        self.drag_start = Some(absolute_pos);
+                        self.drag_end = self.drag_start;
+                    }
+                    if resp.dragged() {
+                        self.drag_end = Some(absolute_pos);
+                    }
+                    if resp.drag_stopped() {
+                        self.drag_end = Some(absolute_pos);
+                        self.bounds_from_drag();
+                        self.picking_area = false;
+                        // Restore window to normal state
+                        self.window_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                        // Reset window size to default
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
+                    }
+
+                    if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                        let rect = Rect::from_two_pos(a, b);
+                        let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                        painter.rect_stroke(rect, 0.0, stroke);
+                    }
+                });
+
+            ctx.request_repaint();
+            return;
+        }
+        if self.picking_area {
+            if self.window_visible {
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                self.window_visible = false;
+                return;
+            }
+        if self.picking_area {
+            // When in picking mode, make window fullscreen and translucent
+            if self.window_visible {
+                self.window_visible = false;
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                return;
+            }
+            
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
+            
+            // Get the screen dimensions and create rect in absolute coordinates
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let screen_rect = egui::Rect::from_min_max(
+                Pos2::new(min_x as f32, min_y as f32),
+                Pos2::new(max_x as f32, max_y as f32)
+            );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
+
+            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
+                let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                
+                // Get absolute screen coordinates using winit
+                let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                    // Use raw cursor position directly
+                    Pos2::new(pos.x, pos.y)
+                } else {
+                    Pos2::new(0.0, 0.0)
+                };
+                
+                if resp.drag_started() {
+                    self.drag_start = Some(absolute_pos);
+                    self.drag_end = self.drag_start;
+                }
+                if resp.dragged() {
+                    self.drag_end = Some(absolute_pos);
+                }
+                if resp.drag_stopped() {
+                    self.drag_end = Some(absolute_pos);
+                    self.bounds_from_drag();
+                    self.picking_area = false;
+                    // Restore window to normal state
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    // Reset window size to default
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
+                }
+
+                if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                    let rect = Rect::from_two_pos(a, b);
+                    let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            });
+
+            ctx.request_repaint();
+            return;
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.heading("Area Clicker — MVP");
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let sequence_mode = self.config.lock().sequence_mode;
+            
+            ui.horizontal_wrapped(|ui| {
+                // Left panel - Sequence management
+                ui.group(|ui| {
+                    let mut sequence_mode = sequence_mode;
+                    if ui.checkbox(&mut sequence_mode, "Enable Sequence Mode").changed() {
+                        self.config.lock().sequence_mode = sequence_mode;
+                    }
+
+                    if sequence_mode {
+                        ui.separator();
+                        ui.label("Sequence Steps");
+                        
+                        // List existing steps
+                        let mut to_remove = None;
+                        {
+                            let config = self.config.lock();
+                            for (i, action) in config.sequence.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(format!("Edit #{}", i + 1)).clicked() {
+                                        self.current_sequence_index = i;
+                                        self.editing_sequence = true;
+                                        self.bounds_inputs = [
+                                            action.bounds.min_x,
+                                            action.bounds.max_x,
+                                            action.bounds.min_y,
+                                            action.bounds.max_y
+                                        ];
+                                        self.click_button_left = matches!(action.button, ClickButton::Left);
+                                        self.min_secs = action.min_secs;
+                                        self.max_secs = action.max_secs;
+                                        self.sequence_edit_name = action.name.clone();
+                                        self.sequence_edit_clicks = action.clicks_per_cycle;
+                                    }
+
+                                    let mut enabled = action.enabled;
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        self.config.lock().sequence[i].enabled = enabled;
+                                    }
+
+                                    ui.label(format!(
+                                        "{}: [{},{}]x[{},{}], {} clicks, {:.1}-{:.1}s",
+                                        action.name,
+                                        action.bounds.min_x, action.bounds.max_x,
+                                        action.bounds.min_y, action.bounds.max_y,
+                                        action.clicks_per_cycle,
+                                        action.min_secs, action.max_secs
+                                    ));
+
+                                    if ui.button("🗑").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                });
+                            }
+                        }
+
+                        // Handle removal outside the iteration
+                        if let Some(i) = to_remove {
+                            self.config.lock().sequence.remove(i);
+                        }
+
+                        // Add new step button
+                        if ui.button("Add New Step").clicked() {
+                            self.current_sequence_index = self.config.lock().sequence.len();
+                            self.editing_sequence = true;
+                            self.bounds_inputs = [100, 400, 100, 400];
+                            self.click_button_left = true;
+                            self.min_secs = 1.0;
+                            self.max_secs = 3.0;
+                            self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
+                            self.sequence_edit_clicks = 1;
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Right panel - Area configuration
+                ui.group(|ui| {
+                    if sequence_mode {
+                        ui.label(if self.editing_sequence {
+                            format!("Editing: {}", self.sequence_edit_name)
+                        } else {
+                            "Select or add a sequence step to edit".to_string()
+                        });
+                    } else {
+                        ui.label("Single Area Configuration");
+                    }
+
+                    ui.horizontal(|ui| { ui.label("min X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[0])); });
+                    ui.horizontal(|ui| { ui.label("max X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[1])); });
+                    ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
+                    ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
+
+                    if ui.button("Pick Area (drag a rectangle)").clicked() { 
+                        self.drag_start = None;
+                        self.drag_end = None;
+                        self.picking_area = true;
+                        self.window_visible = true;
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Click type:");
+                        ui.checkbox(&mut self.click_button_left, "Left");
+                        let mut right = !self.click_button_left;
+                        if ui.checkbox(&mut right, "Right").clicked() { self.click_button_left = !right; }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Interval (seconds):");
+                        ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
+                        ui.label("to");
+                        ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
+                    });
+
+                    if sequence_mode && self.editing_sequence {
+                        ui.horizontal(|ui| {
+                            ui.label("Step name:");
+                            ui.text_edit_singleline(&mut self.sequence_edit_name);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Clicks per cycle:");
+                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).min(1));
+                        });
+                        
+                        if ui.button("Save Step").clicked() {
+                            let action = SequenceAction {
+                                bounds: Bounds {
+                                    min_x: self.bounds_inputs[0],
+                                    max_x: self.bounds_inputs[1],
+                                    min_y: self.bounds_inputs[2],
+                                    max_y: self.bounds_inputs[3],
+                                },
+                                button: if self.click_button_left { ClickButton::Left } else { ClickButton::Right },
+                                min_secs: self.min_secs,
+                                max_secs: self.max_secs,
+                                clicks_per_cycle: self.sequence_edit_clicks,
+                                name: self.sequence_edit_name.clone(),
+                                enabled: true,
+                            };
+
+                            let mut config = self.config.lock();
+                            if self.current_sequence_index < config.sequence.len() {
+                                config.sequence[self.current_sequence_index] = action;
+                            } else {
+                                config.sequence.push(action);
+                            }
+                            self.editing_sequence = false;
+                        }
+                    } else if !sequence_mode {
+                        ui.horizontal(|ui| {
+                            ui.label("Click limit:");
+                            let mut has_limit = self.finite_clicks.is_some();
+                            if ui.checkbox(&mut has_limit, "Limited clicks").clicked() {
+                                self.finite_clicks = if has_limit { Some(100) } else { None };
+                            }
+                            if let Some(ref mut clicks) = self.finite_clicks {
+                                ui.add(egui::DragValue::new(clicks).speed(1.0));
+                            }
+                        });
+                    } else if sequence_mode {
+                        ui.horizontal(|ui| {
+                            ui.label("Sequence cycles:");
+                            let mut has_cycles = self.sequence_cycles.is_some();
+                            if ui.checkbox(&mut has_cycles, "Limited cycles").clicked() {
+                                self.sequence_cycles = if has_cycles { Some(1) } else { None };
+                            }
+                            if let Some(ref mut cycles) = self.sequence_cycles {
+                                ui.add(egui::DragValue::new(cycles).speed(1.0));
+                            }
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Start").clicked() { self.start(); }
+                        if ui.button("Pause").clicked() { self.pause(); }
+                        if ui.button("Stop").clicked() { self.stop(); }
+                    });
+
+                    if let Some(job) = &self.job {
+                        let running = job.running.load(Ordering::Relaxed);
+                        ui.label(format!("Status: {}", if running { "Running" } else { "Stopped" }));
+                    } else {
+                        ui.label("Status: Stopped");
+                    }
+                });
+            });
+
+            // Preview rectangle
+            if let Some(b) = self.config.lock().bounds {
+                let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})", 
+                    b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
+                ui.separator();
+                ui.monospace(info);
+            }
+        });
+    }
+        if self.picking_area {
+            // When in picking mode, make window fullscreen and translucent
+            if self.window_visible {
+                self.window_visible = false;
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                return;
+            }
+            
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
+            
+            // Get the screen dimensions and create rect in absolute coordinates
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let screen_rect = egui::Rect::from_min_max(
+                Pos2::new(min_x as f32, min_y as f32),
+                Pos2::new(max_x as f32, max_y as f32)
+            );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
+
+            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
+                let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                
+                // Get absolute screen coordinates using winit
+                let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                    // Use raw cursor position directly
+                    Pos2::new(pos.x, pos.y)
+                } else {
+                    Pos2::new(0.0, 0.0)
+                };
+                
+                if resp.drag_started() {
+                    self.drag_start = Some(absolute_pos);
+                    self.drag_end = self.drag_start;
+                }
+                if resp.dragged() {
+                    self.drag_end = Some(absolute_pos);
+                }
+                if resp.drag_stopped() {
+                    self.drag_end = Some(absolute_pos);
+                    self.bounds_from_drag();
+                    self.picking_area = false;
+                    // Restore window to normal state
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    // Reset window size to default
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
+                }
+
+                if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                    let rect = Rect::from_two_pos(a, b);
+                    let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            });
+
+            ctx.request_repaint();
+            return;
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.heading("Area Clicker — MVP");
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let sequence_mode = self.config.lock().sequence_mode;
+            
+            ui.horizontal_wrapped(|ui| {
+                // Left panel - Sequence management
+                ui.group(|ui| {
+                    let mut sequence_mode = sequence_mode;
+                    if ui.checkbox(&mut sequence_mode, "Enable Sequence Mode").changed() {
+                        self.config.lock().sequence_mode = sequence_mode;
+                    }
+
+                    if sequence_mode {
+                        ui.separator();
+                        ui.label("Sequence Steps");
+                        
+                        // List existing steps
+                        let mut to_remove = None;
+                        {
+                            let config = self.config.lock();
+                            for (i, action) in config.sequence.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.button(format!("Edit #{}", i + 1)).clicked() {
+                                        self.current_sequence_index = i;
+                                        self.editing_sequence = true;
+                                        self.bounds_inputs = [
+                                            action.bounds.min_x,
+                                            action.bounds.max_x,
+                                            action.bounds.min_y,
+                                            action.bounds.max_y
+                                        ];
+                                        self.click_button_left = matches!(action.button, ClickButton::Left);
+                                        self.min_secs = action.min_secs;
+                                        self.max_secs = action.max_secs;
+                                        self.sequence_edit_name = action.name.clone();
+                                        self.sequence_edit_clicks = action.clicks_per_cycle;
+                                    }
+
+                                    let mut enabled = action.enabled;
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        self.config.lock().sequence[i].enabled = enabled;
+                                    }
+
+                                    ui.label(format!(
+                                        "{}: [{},{}]x[{},{}], {} clicks, {:.1}-{:.1}s",
+                                        action.name,
+                                        action.bounds.min_x, action.bounds.max_x,
+                                        action.bounds.min_y, action.bounds.max_y,
+                                        action.clicks_per_cycle,
+                                        action.min_secs, action.max_secs
+                                    ));
+
+                                    if ui.button("🗑").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                });
+                            }
+                        }
+
+                        // Handle removal outside the iteration
+                        if let Some(i) = to_remove {
+                            self.config.lock().sequence.remove(i);
+                        }
+
+                        // Add new step button
+                        if ui.button("Add New Step").clicked() {
+                            self.current_sequence_index = self.config.lock().sequence.len();
+                            self.editing_sequence = true;
+                            self.bounds_inputs = [100, 400, 100, 400];
+                            self.click_button_left = true;
+                            self.min_secs = 1.0;
+                            self.max_secs = 3.0;
+                            self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
+                            self.sequence_edit_clicks = 1;
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Right panel - Area configuration
+                ui.group(|ui| {
+                    if sequence_mode {
+                        ui.label(if self.editing_sequence {
+                            format!("Editing: {}", self.sequence_edit_name)
+                        } else {
+                            "Select or add a sequence step to edit".to_string()
+                        });
+                    } else {
+                        ui.label("Single Area Configuration");
+                    }
+
+                    ui.horizontal(|ui| { ui.label("min X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[0])); });
+                    ui.horizontal(|ui| { ui.label("max X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[1])); });
+                    ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
+                    ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
+
+                    if ui.button("Pick Area (drag a rectangle)").clicked() { 
+                        self.drag_start = None;
+                        self.drag_end = None;
+                        self.picking_area = true;
+                        self.window_visible = true;
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Click type:");
+                        ui.checkbox(&mut self.click_button_left, "Left");
+                        let mut right = !self.click_button_left;
+                        if ui.checkbox(&mut right, "Right").clicked() { self.click_button_left = !right; }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Interval (seconds):");
+                        ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
+                        ui.label("to");
+                        ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
+                    });
+
+                    if sequence_mode && self.editing_sequence {
+                        ui.horizontal(|ui| {
+                            ui.label("Step name:");
+                            ui.text_edit_singleline(&mut self.sequence_edit_name);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Clicks per cycle:");
+                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).min(1));
+                        });
+                        
+                        if ui.button("Save Step").clicked() {
+                            let action = SequenceAction {
+                                bounds: Bounds {
+                                    min_x: self.bounds_inputs[0],
+                                    max_x: self.bounds_inputs[1],
+                                    min_y: self.bounds_inputs[2],
+                                    max_y: self.bounds_inputs[3],
+                                },
+                                button: if self.click_button_left { ClickButton::Left } else { ClickButton::Right },
+                                min_secs: self.min_secs,
+                                max_secs: self.max_secs,
+                                clicks_per_cycle: self.sequence_edit_clicks,
+                                name: self.sequence_edit_name.clone(),
+                                enabled: true,
+                            };
+
+                            let mut config = self.config.lock();
+                            if self.current_sequence_index < config.sequence.len() {
+                                config.sequence[self.current_sequence_index] = action;
+                            } else {
+                                config.sequence.push(action);
+                            }
+                            self.editing_sequence = false;
+                        }
+                    } else if !sequence_mode {
+                        ui.horizontal(|ui| {
+                            ui.label("Click limit:");
+                            let mut has_limit = self.finite_clicks.is_some();
+                            if ui.checkbox(&mut has_limit, "Limited clicks").clicked() {
+                                self.finite_clicks = if has_limit { Some(100) } else { None };
+                            }
+                            if let Some(ref mut clicks) = self.finite_clicks {
+                                ui.add(egui::DragValue::new(clicks).speed(1.0));
+                            }
+                        });
+                    } else if sequence_mode {
+                        ui.horizontal(|ui| {
+                            ui.label("Sequence cycles:");
+                            let mut has_cycles = self.sequence_cycles.is_some();
+                            if ui.checkbox(&mut has_cycles, "Limited cycles").clicked() {
+                                self.sequence_cycles = if has_cycles { Some(1) } else { None };
+                            }
+                            if let Some(ref mut cycles) = self.sequence_cycles {
+                                ui.add(egui::DragValue::new(cycles).speed(1.0));
+                            }
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Start").clicked() { self.start(); }
+                        if ui.button("Pause").clicked() { self.pause(); }
+                        if ui.button("Stop").clicked() { self.stop(); }
+                    });
+
+                    if let Some(job) = &self.job {
+                        let running = job.running.load(Ordering::Relaxed);
+                        ui.label(format!("Status: {}", if running { "Running" } else { "Stopped" }));
+                    } else {
+                        ui.label("Status: Stopped");
+                    }
+                });
+            });
+
+            // Preview rectangle
+            if let Some(b) = self.config.lock().bounds {
+                let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})", 
+                    b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
+                ui.separator();
+                ui.monospace(info);
+            }
+        });
+    }
+                self.window_visible = false;
+                // Get screen dimensions
+                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                
+                // Make window fullscreen and center it
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                return;
+            }
+            
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("picker"));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                layer_id,
+                egui::Rect::EVERYTHING,
+            );
+            
+            // Get the screen dimensions and create rect in absolute coordinates
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let screen_rect = egui::Rect::from_min_max(
+                Pos2::new(min_x as f32, min_y as f32),
+                Pos2::new(max_x as f32, max_y as f32)
+            );
+            
+            painter.rect_filled(screen_rect, 0.0, Color32::from_rgba_premultiplied(128, 128, 128, 100));
+
+            egui::Area::new(egui::Id::new("picker_area")).order(egui::Order::Foreground).show(ctx, |ui| {
+                let resp = ui.allocate_rect(screen_rect, Sense::click_and_drag());
+                
+                // Get absolute screen coordinates using winit
+                let absolute_pos = if let Some(pos) = resp.hover_pos() {
+                    // Use raw cursor position directly
+                    Pos2::new(pos.x, pos.y)
+                } else {
+                    Pos2::new(0.0, 0.0)
+                };
+                
+                if resp.drag_started() {
+                    self.drag_start = Some(absolute_pos);
+                    self.drag_end = self.drag_start;
+                }
+                if resp.dragged() {
+                    self.drag_end = Some(absolute_pos);
+                }
+                if resp.drag_stopped() {
+                    self.drag_end = Some(absolute_pos);
+                    self.bounds_from_drag();
+                    self.picking_area = false;
+                    // Restore window to normal state
+                    self.window_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                    // Reset window size to default
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(520.0, 380.0)));
+                }
+
+                if let (Some(a), Some(b)) = (self.drag_start, self.drag_end) {
+                    let rect = Rect::from_two_pos(a, b);
+                    let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
+            });
+
+            ctx.request_repaint();
+            return; // Skip main UI while picking
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.heading("Area Clicker — MVP");
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // Left panel - Sequence management
+                ui.group(|ui| {
+                    let sequence_mode = self.config.lock().sequence_mode;
+                    ui.checkbox(&mut self.config.lock().sequence_mode, "Enable Sequence Mode");
+                    
+                    if sequence_mode {
+                    ui.label("Sequence Mode");
+                    ui.checkbox(&mut config.sequence_mode, "Enable Sequence Mode");
+                    
+                    if config.sequence_mode {
+                        ui.separator();
+                        ui.label("Sequence Steps");
+                        
+                        // List existing sequence steps
+                        for (i, action) in config.sequence.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.button(format!("Edit #{}", i + 1)).clicked() {
+                                    self.current_sequence_index = i;
+                                    self.editing_sequence = true;
+                                    // Load the current action's settings into the editor
+                                    self.bounds_inputs = [
+                                        action.bounds.min_x,
+                                        action.bounds.max_x,
+                                        action.bounds.min_y,
+                                        action.bounds.max_y
+                                    ];
+                                    self.click_button_left = matches!(action.button, ClickButton::Left);
+                                    self.min_secs = action.min_secs;
+                                    self.max_secs = action.max_secs;
+                                }
+                                ui.label(format!(
+                                    "Area: [{}, {}] x [{}, {}], {} clicks, {:.1}-{:.1}s",
+                                    action.bounds.min_x, action.bounds.max_x,
+                                    action.bounds.min_y, action.bounds.max_y,
+                                    action.clicks_per_cycle,
+                                    action.min_secs, action.max_secs
+                                ));
+                                if ui.button("🗑").clicked() {
+                                    config.sequence.remove(i);
+                                }
+                            });
+                        }
+
+                        // Add new sequence step button
+                        if ui.button("Add New Step").clicked() {
+                            self.current_sequence_index = config.sequence.len();
+                            self.editing_sequence = true;
+                            // Reset editor to defaults
+                            self.bounds_inputs = [100, 400, 100, 400];
+                            self.click_button_left = true;
+                            self.min_secs = 1.0;
+                            self.max_secs = 3.0;
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Right panel - Area configuration
+                ui.group(|ui| {
+                    if config.sequence_mode {
+                        ui.label(if self.editing_sequence {
+                            format!("Editing Sequence Step #{}", self.current_sequence_index + 1)
+                        } else {
+                            "Select or add a sequence step to edit".to_string()
+                        });
+                    } else {
+                        ui.label("Single Area Configuration");
+                    }
+
+                    ui.horizontal(|ui| { ui.label("min X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[0])); });
+                    ui.horizontal(|ui| { ui.label("max X"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[1])); });
+                    ui.horizontal(|ui| { ui.label("min Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[2])); });
+                    ui.horizontal(|ui| { ui.label("max Y"); ui.add(egui::DragValue::new(&mut self.bounds_inputs[3])); });
+
+                    if ui.button("Pick Area (drag a rectangle)").clicked() { 
+                        self.drag_start = None;
+                        self.drag_end = None;
+                        self.picking_area = true;
+                        self.window_visible = true; // Will be set to false on next frame
+                    }
+
+                    if config.sequence_mode && self.editing_sequence {
+                        if ui.button("Save Step").clicked() {
+                            let action = SequenceAction {
+                                bounds: Bounds {
+                                    min_x: self.bounds_inputs[0],
+                                    max_x: self.bounds_inputs[1],
+                                    min_y: self.bounds_inputs[2],
+                                    max_y: self.bounds_inputs[3],
+                                },
+                                button: if self.click_button_left { ClickButton::Left } else { ClickButton::Right },
+                                min_secs: self.min_secs,
+                                max_secs: self.max_secs,
+                                clicks_per_cycle: 1,
+                                name: format!("Step {}", self.current_sequence_index + 1),
+                                enabled: true,
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.label("Clicks per cycle:");
+                                if let Some(action) = config.sequence.get_mut(self.current_sequence_index) {
+                                    ui.add(egui::DragValue::new(&mut action.clicks_per_cycle).speed(1.0));
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Step name:");
+                                if let Some(action) = config.sequence.get_mut(self.current_sequence_index) {
+                                    let mut name = action.name.clone();
+                                    if ui.text_edit_singleline(&mut name).changed() {
+                                        action.name = name;
+                                    }
+                                }
+                            });
+
+                            if self.current_sequence_index < config.sequence.len() {
+                                config.sequence[self.current_sequence_index] = action;
+                            } else {
+                                config.sequence.push(action);
+                            }
+                            self.editing_sequence = false;
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                ui.group(|ui| {
+                    ui.label("Settings");
+                    ui.horizontal(|ui| {
+                        ui.label("Click type:");
+                        ui.checkbox(&mut self.click_button_left, "Left");
+                        let mut right = !self.click_button_left;
+                        if ui.checkbox(&mut right, "Right").clicked() { self.click_button_left = !right; }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Interval (seconds):");
+                        ui.add(egui::DragValue::new(&mut self.min_secs).speed(0.1));
+                        ui.label("to");
+                        ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Click limit:");
+                        let mut has_limit = self.finite_clicks.is_some();
+                        if ui.checkbox(&mut has_limit, "Limited clicks").clicked() {
+                            self.finite_clicks = if has_limit { Some(100) } else { None };
+                        }
+                        if let Some(ref mut clicks) = self.finite_clicks {
+                            ui.add(egui::DragValue::new(clicks).speed(1.0));
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Sequence cycles:");
+                        let mut has_cycles = self.sequence_cycles.is_some();
+                        if ui.checkbox(&mut has_cycles, "Limited cycles").clicked() {
+                            self.sequence_cycles = if has_cycles { Some(1) } else { None };
+                        }
+                        if let Some(ref mut cycles) = self.sequence_cycles {
+                            ui.add(egui::DragValue::new(cycles).speed(1.0));
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Start").clicked() { self.start(); }
+                        if ui.button("Pause").clicked() { self.pause(); }
+                        if ui.button("Stop").clicked() { self.stop(); }
+                    });
+
+                    if let Some(job) = &self.job {
+                        let running = job.running.load(Ordering::Relaxed);
+                        ui.label(format!("Status: {}", if running {"Running"} else {"Stopped"}));
+                    } else {
+                        ui.label("Status: Stopped");
+                    }
+                });
+            });
+
+            // Preview rectangle
+            if let Some(b) = self.config.lock().bounds {
+                let info = format!("Active bounds: x=[{}..{}], y=[{}..{}] ({}x{})", b.min_x, b.max_x, b.min_y, b.max_y, b.width(), b.height());
+                ui.separator();
+                ui.monospace(info);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::Pos2;
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn test_bounds_validation() {
+        let valid_bounds = Bounds {
+            min_x: 100,
+            max_x: 200,
+            min_y: 100,
+            max_y: 200,
+        };
+        assert!(valid_bounds.is_valid());
+        assert_eq!(valid_bounds.width(), 100);
+        assert_eq!(valid_bounds.height(), 100);
+
+        let invalid_bounds = Bounds {
+            min_x: 200,
+            max_x: 100,
+            min_y: 200,
+            max_y: 100,
+        };
+        assert!(!invalid_bounds.is_valid());
+    }
+
+    #[test]
+    fn test_click_job_creation() {
+        let config = Arc::new(Mutex::new(ClickConfig {
+            bounds: Some(Bounds {
+                min_x: 100,
+                max_x: 200,
+                min_y: 100,
+                max_y: 200,
+            }),
+            button: ClickButton::Left,
+            min_secs: 1.0,
+            max_secs: 2.0,
+        }));
+
+        let job = ClickJob::spawn(Arc::clone(&config));
+        assert!(job.running.load(Ordering::Relaxed));
+
+        // Test stopping
+        job.stop();
+        assert!(!job.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_app_state_defaults() {
+        let state = AppState::default();
+        assert!(!state.picking_area);
+        assert!(state.drag_start.is_none());
+        assert!(state.drag_end.is_none());
+        assert!(state.click_button_left);
+        assert!(state.job.is_none());
+        
+        // Check default bounds
+        assert_eq!(state.bounds_inputs, [100, 400, 100, 400]);
+        
+        // Check default timing
+        assert_eq!(state.min_secs, 1.0);
+        assert_eq!(state.max_secs, 3.0);
+    }
+
+    #[test]
+    fn test_bounds_from_drag() {
+        let mut state = AppState::default();
+        
+        // Test drag selection
+        state.drag_start = Some(Pos2::new(100.0, 100.0));
+        state.drag_end = Some(Pos2::new(200.0, 200.0));
+        state.bounds_from_drag();
+
+        assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
+        
+        // Test reverse drag (from bottom-right to top-left)
+        state.drag_start = Some(Pos2::new(200.0, 200.0));
+        state.drag_end = Some(Pos2::new(100.0, 100.0));
+        state.bounds_from_drag();
+
+        assert_eq!(state.bounds_inputs, [100, 200, 100, 200]);
+    }
+
+    #[test]
+    fn test_click_interval() {
+        let config = Arc::new(Mutex::new(ClickConfig {
+            bounds: Some(Bounds {
+                min_x: 100,
+                max_x: 200,
+                min_y: 100,
+                max_y: 200,
+            }),
+            button: ClickButton::Left,
+            min_secs: 0.1,
+            max_secs: 0.2,
+        }));
+
+        let job = ClickJob::spawn(Arc::clone(&config));
+        
+        // Let it run briefly to ensure it's working
+        std::thread::sleep(Duration::from_millis(500));
+        
+        job.stop();
+        assert!(!job.running.load(Ordering::Relaxed));
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    // Initialize with default display size
+    let en = enigo::Enigo::new();
+    let (w, h) = en.main_display_size();
+    
+    let mut opts = eframe::NativeOptions::default();
+    opts.viewport.inner_size = Some(egui::vec2(w as f32, h as f32));
+    opts.viewport.transparent = Some(true);
+    opts.viewport.maximized = Some(true); // Start maximized
+    opts.viewport.resizable = Some(true);
+    opts.viewport.mouse_passthrough = Some(false); // Ensure we can capture mouse events
+    opts.follow_system_theme = true;
+    
+    eframe::run_native(
+        "Area Clicker",
+        opts,
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Box::<AppState>::default()
+        }),
+    )
+}

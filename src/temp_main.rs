@@ -2,23 +2,10 @@ mod human_mouse;
 
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense}};
 use enigo::{self, MouseButton, MouseControllable};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::Rng;
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
-
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 380.0])
-            .with_min_inner_size([520.0, 380.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Area Clicker",
-        options,
-        Box::new(|cc| Box::new(AppState::new(cc)))
-    )
-}
 
 // -------------- Click Engine --------------
 #[derive(Clone, Copy, Debug)]
@@ -152,8 +139,7 @@ impl AppState {
                             let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
                             let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
                             
-                            let (start_x, start_y) = enigo.mouse_location();
-                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
+                            human_mouse::move_mouse_smoothly(&mut enigo, x, y);
                             
                             let button = match action.button {
                                 ClickButton::Left => MouseButton::Left,
@@ -183,10 +169,9 @@ impl AppState {
                         let x = rng.gen_range(bounds.min_x..=bounds.max_x);
                         let y = rng.gen_range(bounds.min_y..=bounds.max_y);
                         
-                            let (start_x, start_y) = enigo.mouse_location();
-                            human_mouse::move_mouse_human(&mut enigo, start_x, start_y, x, y);
-                            
-                            let button = match cfg.button {
+                        human_mouse::move_mouse_smoothly(&mut enigo, x, y);
+                        
+                        let button = match cfg.button {
                             ClickButton::Left => MouseButton::Left,
                             ClickButton::Right => MouseButton::Right,
                         };
@@ -461,7 +446,7 @@ impl eframe::App for AppState {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Clicks per cycle:");
-                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).clamp_range(1..=1000));
+                            ui.add(egui::DragValue::new(&mut self.sequence_edit_clicks).speed(1.0).min(1));
                         });
                         
                         if ui.button("Save Step").clicked() {
