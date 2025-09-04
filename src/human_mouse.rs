@@ -27,9 +27,7 @@ impl Bounds {
     pub fn is_valid(&self) -> bool {
         self.width() > 0 && self.height() > 0
     }
-    pub fn width(&self) -> i32 { self.max_x - self.min_x }
-    pub fn height(&self) -> i32 { self.max_y - self.min_y }
-    pub fn is_valid(&self) -> bool { self.width() > 0 && self.height() > 0 }
+
 }
 
 #[derive(Clone, Debug)]

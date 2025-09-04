@@ -1,17 +1,34 @@
 mod human_mouse;
 
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
-use enigo::MouseControllable;
+use enigo::{MouseControllable, MouseButton, Enigo};
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use std::s                    // Move mouse with human-like motion
-                    if let Some((last_x, last_y)) = last_pos {
-                        human_mouse::move_mouse_human(last_x, last_y, x, y);
-                    } else {
-                        // First move is direct
-                        enigo.mouse_move_to(x, y);
-                    }atomic::{AtomicBool, Ordering}, Arc};
-use crate::human_mouse::{HumanMouseSettings, Bounds, human_move_and_click};
+use park                } else {
+                    // Legacy single-region mode
+                    if let Some(bounds) = &config.bounds {
+                        if !bounds.is_valid() {
+                            drop(config);
+                            std::thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
+
+                        // Get random point within bounds
+                        let x = rng.gen_range(bounds.min_x..=bounds.max_x);
+                        let y = rng.gen_range(bounds.min_y..=bounds.max_y);
+                        
+                        // Move mouse with human-like motion
+                        if let Some((last_x, last_y)) = last_pos {
+                            human_mouse::move_mouse_human(last_x, last_y, x, y);
+                        } else {
+                            // First move is direct
+                            enigo.mouse_move_to(x, y);
+                        }
+                        
+                        // Update position
+                        last_pos = Some((x, y)); std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::time::Duration;
+use rand::Rng;
+use crate::human_mouse::Bounds;
 
 use clap::Parser;
 
@@ -114,6 +131,7 @@ impl ClickJob {
             let mut clicks_remaining = config_clone.lock().finite_clicks;
 
             while running_clone.load(Ordering::Relaxed) {
+                // Get a snapshot of the config at the start of each iteration
                 let config = config_clone.lock();
                 let mut enigo = enigo::Enigo::new();
 
@@ -126,38 +144,40 @@ impl ClickJob {
                 
                 if config.sequence_mode {
                     // Get current action
-                    if let Some(ref actions) = &config.sequence_actions {
-                        if actions.is_empty() {
-                            drop(config);
-                            std::thread::sleep(Duration::from_millis(200));
-                            continue;
-                        }
+                    if config.sequence.is_empty() {
+                        drop(config);
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
 
-                        let current_action_idx = config.current_action_index as usize % actions.len();
-                        let action = &actions[current_action_idx];
+                    let action = &config.sequence[config.current_action];
+                    
+                    // Check if we need to move to next action
+                    if current_action_clicks >= action.clicks_per_cycle {
+                        current_action_clicks = 0;
                         
-                        // Check if we need to move to next action
-                        if current_action_clicks >= action.num_clicks {
-                            current_action_clicks = 0;
+                        // Update cycle count if we're at the end of sequence
+                        if config.current_action == config.sequence.len() - 1 {
+                            cycles_completed += 1;
                             
-                            // Update cycle count if we're at the end of sequence
-                            if current_action_idx == actions.len() - 1 {
-                                cycles_completed += 1;
-                                
-                                // Check cycle limit
-                                if let Some(max_cycles) = config.max_cycles {
-                                    if cycles_completed >= max_cycles {
-                                        break;
-                                    }
+                            // Check cycle limit
+                            if let Some(max_cycles) = config.sequence_cycles {
+                                if cycles_completed >= max_cycles {
+                                    break;
                                 }
                             }
                             
-                            continue;
+                            config.current_action = 0;
+                        } else {
+                            config.current_action += 1;
                         }
+                        
+                        continue;
+                    }
 
                         // Get random point within current action's bounds
-                        let x = rng.gen_range(action.bounds.left..=action.bounds.right);
-                        let y = rng.gen_range(action.bounds.top..=action.bounds.bottom);
+                        let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
+                        let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
                         
                         // Move mouse with human-like motion
                         if let Some((last_x, last_y)) = last_pos {
@@ -173,7 +193,9 @@ impl ClickJob {
                         current_action_clicks += 1;
 
                         // Random delay based on action's interval settings
-                        let delay = rng.gen_range(action.min_interval..=action.max_interval);
+                        let min_ms = (action.min_secs * 1000.0) as u64;
+                        let max_ms = (action.max_secs * 1000.0) as u64;
+                        let delay = rng.gen_range(min_ms..=max_ms);
                         std::thread::sleep(Duration::from_millis(delay));
                     }
                 } else {
@@ -356,6 +378,10 @@ impl Default for AppState {
                 min_secs: 2.0,
                 max_secs: 4.5,
                 finite_clicks: None,
+                sequence_mode: false,
+                sequence: Vec::new(),
+                sequence_cycles: None,
+                current_action: 0,
             })),
         }
     }
