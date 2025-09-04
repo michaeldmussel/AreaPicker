@@ -1,170 +1,38 @@
+mod human_mouse;
+
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
-use enigo::{MouseButton, MouseControllable};
+use enigo::MouseControllable;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand::{Rng, rngs::StdRng, SeedableRng};
-use std::{thread, time::Duration};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
-use std::f32::consts::PI;
+use crate::human_mouse::{HumanMouseSettings, Bounds, human_move_and_click};
 
-// Human Mouse Movement Settings
-struct HumanMouseSettings {
-    avg_speed: f32,
-    speed_jitter: f32,
-    micro_jitter_px: f32,
-    micro_jitter_hz: f32,
-    overshoot_chance: f32,
-    overshoot_px: f32,
-    min_pause_ms: u64,
-    max_pause_ms: u64,
-    rng_seed: Option<u64>,
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Total number of random clicks to perform before stopping (0 = infinite)
+    #[arg(long = "clicks", default_value_t = 0)]
+    clicks: u32,
+
+    /// Optional min delay between clicks in ms
+    #[arg(long = "min-delay-ms", default_value_t = 75)]
+    min_delay_ms: u64,
+
+    /// Optional max delay between clicks in ms
+    #[arg(long = "max-delay-ms", default_value_t = 250)]
+    max_delay_ms: u64,
 }
 
-impl Default for HumanMouseSettings {
-    fn default() -> Self {
-        Self {
-            avg_speed: 1400.0,
-            speed_jitter: 0.25,
-            micro_jitter_px: 0.6,
-            micro_jitter_hz: 9.0,
-            overshoot_chance: 0.25,
-            overshoot_px: 12.0,
-            min_pause_ms: 15,
-            max_pause_ms: 60,
-            rng_seed: None,
-        }
-    }
-}
+// Click operation utilities
 
-fn ease_in_out(t: f32) -> f32 {
-    0.5 - 0.5 * (PI * t).cos()
-}
+/// Moved to separate module
 
-fn cubic_bezier(p0: (f32,f32), p1: (f32,f32), p2: (f32,f32), p3: (f32,f32), t: f32) -> (f32,f32) {
-    let u = 1.0 - t;
-    let uu = u * u;
-    let tt = t * t;
-    let uuu = uu * u;
-    let ttt = tt * t;
-    (
-        uuu*p0.0 + 3.0*uu*t*p1.0 + 3.0*u*tt*p2.0 + ttt*p3.0,
-        uuu*p0.1 + 3.0*uu*t*p1.1 + 3.0*u*tt*p2.1 + ttt*p3.1,
-    )
-}
-
-fn len((x1,y1): (f32,f32), (x2,y2): (f32,f32)) -> f32 {
-    ((x2-x1).hypot(y2-y1)).max(1.0)
-}
-
-fn make_bezier_with_wiggle(
-    from: (i32,i32), 
-    to: (i32,i32), 
-    rng: &mut impl Rng
-) -> ((f32,f32),(f32,f32),(f32,f32),(f32,f32)) {
-    let p0 = (from.0 as f32, from.1 as f32);
-    let p3 = (to.0 as f32, to.1 as f32);
-
-    let dx = p3.0 - p0.0;
-    let dy = p3.1 - p0.1;
-    let dist = len(p0, p3);
-    let (nx, ny) = if dist > 0.0 { (-dy / dist, dx / dist) } else { (0.0, 0.0) };
-
-    let cdist = 0.25 * dist;
-    let amp1 = rng.gen_range(-0.12..0.12) * dist;
-    let amp2 = rng.gen_range(-0.12..0.12) * dist;
-
-    let p1 = (p0.0 + dx * 0.30 + nx * amp1, p0.1 + dy * 0.30 + ny * amp1);
-    let p2 = (p0.0 + dx * 0.70 + nx * amp2, p0.1 + dy * 0.70 + ny * amp2);
-
-    let p1 = (p1.0 + (dx / dist) * (cdist * 0.1), p1.1 + (dy / dist) * (cdist * 0.1));
-    let p2 = (p2.0 - (dx / dist) * (cdist * 0.1), p2.1 - (dy / dist) * (cdist * 0.1));
-
-    (p0, p1, p2, p3)
-}
-
-fn human_move_and_click(
-    enigo: &mut impl MouseControllable,
-    from: (i32,i32),
-    to: (i32,i32),
-    bounds: Option<Bounds>,
-    settings: &HumanMouseSettings,
-    button: MouseButton,
-) {
-    let mut rng: StdRng = match settings.rng_seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::from_entropy(),
-    };
-
-    let (p0, p1, p2, p3) = make_bezier_with_wiggle(from, to, &mut rng);
-    let distance = len(p0, p3);
-    let speed_variation = 1.0 + settings.speed_jitter * rng.gen_range(-1.0..1.0);
-    let px_per_sec = (settings.avg_speed * speed_variation).max(200.0);
-    let total_ms = ((distance / px_per_sec) * 1000.0).clamp(60.0, 1600.0) as u64;
-
-    let step_ms = rng.gen_range(8..=12);
-    let steps = (total_ms / step_ms.max(1)).max(3) as usize;
-    let maybe_pause_at = if rng.gen::<f32>() < 0.25 {
-        Some(rng.gen_range(steps/3..(2*steps/3).max(steps/3+1)))
-    } else {
-        None
-    };
-
-    let jitter_amp = settings.micro_jitter_px;
-    let jitter_hz = (settings.micro_jitter_hz * (1.0 + rng.gen_range(-0.2..0.2))).max(1.0);
-
-    for i in 0..=steps {
-        let raw_t = i as f32 / steps as f32;
-        let t = ease_in_out(raw_t);
-        let (mut x, mut y) = cubic_bezier(p0, p1, p2, p3, t);
-
-        let w = 2.0 * PI * jitter_hz * (i as f32 * (step_ms as f32 / 1000.0));
-        let jitter = w.sin() * jitter_amp + rng.gen_range(-jitter_amp..jitter_amp) * 0.25;
-
-        let tp = cubic_bezier(p0, p1, p2, p3, (t + 1.0/steps as f32).min(1.0));
-        let dx = tp.0 - x;
-        let dy = tp.1 - y;
-        let d = (dx*dx + dy*dy).sqrt().max(1.0);
-        let (nx, ny) = (-dy/d, dx/d);
-        x += nx * jitter;
-        y += ny * jitter;
-
-        let (mut xi, mut yi) = (x.round() as i32, y.round() as i32);
-        if let Some(b) = bounds {
-            if xi < b.min_x { xi = b.min_x; }
-            if xi > b.max_x { xi = b.max_x; }
-            if yi < b.min_y { yi = b.min_y; }
-            if yi > b.max_y { yi = b.max_y; }
-        }
-
-        enigo.mouse_move_to(xi, yi);
-
-        if let Some(pause_idx) = maybe_pause_at {
-            if i == pause_idx {
-                thread::sleep(Duration::from_millis(
-                    rng.gen_range(settings.min_pause_ms..=settings.max_pause_ms)
-                ));
-            }
-        }
-
-        thread::sleep(Duration::from_millis(step_ms));
-    }
-
-    enigo.mouse_down(button);
-    thread::sleep(Duration::from_millis(20 + rand::thread_rng().gen_range(0..50)));
-    enigo.mouse_up(button);
-}
-// -------------- Click Engine --------------
 #[derive(Clone, Copy, Debug)]
 enum ClickButton { Left, Right }
 
-#[derive(Clone, Copy, Debug)]
-struct Bounds { min_x: i32, max_x: i32, min_y: i32, max_y: i32 }
 
-impl Bounds {
-    fn width(&self) -> i32 { self.max_x - self.min_x }
-    fn height(&self) -> i32 { self.max_y - self.min_y }
-    fn is_valid(&self) -> bool { self.width() > 0 && self.height() > 0 }
-}
 
 struct ClickJob {
     running: Arc<AtomicBool>,
@@ -178,6 +46,7 @@ struct ClickConfig {
     button: ClickButton,
     min_secs: f32,
     max_secs: f32,
+    finite_clicks: Option<u32>,  // None for infinite, Some(n) for n clicks
 }
 
 static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::new()));
@@ -200,9 +69,16 @@ impl ClickJob {
         std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
             let mut last_pos: Option<(i32,i32)> = None;
+            let mut clicks_remaining = config_clone.lock().finite_clicks;
 
             loop {
                 if !running_clone.load(Ordering::Relaxed) { break; }
+                
+                // Check if we've completed our finite clicks
+                if let Some(0) = clicks_remaining {
+                    running_clone.store(false, Ordering::Relaxed);
+                    break;
+                }
 
                 let cfg = config_clone.lock().clone();
                 let Some(b) = cfg.bounds else {
@@ -245,6 +121,11 @@ impl ClickJob {
 
                 // remember where we ended up
                 last_pos = Some((x, y));
+
+                // Update click counter if we're using finite clicks
+                if let Some(ref mut remaining) = clicks_remaining {
+                    *remaining = remaining.saturating_sub(1);
+                }
 
                 // sleep random between min..max (seconds), while checking stop flag
                 let (min_s, max_s) = if cfg.min_secs <= cfg.max_secs {
@@ -353,6 +234,8 @@ struct AppState {
     click_button_left: bool,
     min_secs: f32,
     max_secs: f32,
+    use_finite_clicks: bool,
+    num_clicks: u32,
 
     // Engine
     job: Option<ClickJob>,
@@ -374,6 +257,8 @@ impl Default for AppState {
             click_button_left: true,
             min_secs: 2.0,
             max_secs: 4.5,
+            use_finite_clicks: false,
+            num_clicks: 100,
 
             job: None,
             config: Arc::new(Mutex::new(ClickConfig{
@@ -381,6 +266,7 @@ impl Default for AppState {
                 button: ClickButton::Left,
                 min_secs: 2.0,
                 max_secs: 4.5,
+                finite_clicks: None,
             })),
         }
     }
@@ -393,6 +279,7 @@ impl AppState {
         cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
         cfg.min_secs = self.min_secs;
         cfg.max_secs = self.max_secs;
+        cfg.finite_clicks = if self.use_finite_clicks { Some(self.num_clicks) } else { None };
         cfg.bounds = Some(Bounds{
             min_x: self.bounds_inputs[0],
             max_x: self.bounds_inputs[1],
@@ -602,6 +489,12 @@ impl eframe::App for AppState {
                             ui.add(egui::DragValue::new(&mut self.max_secs).speed(0.1));
                         });
                         ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.use_finite_clicks, "Limit number of clicks");
+                            if self.use_finite_clicks {
+                                ui.add(egui::DragValue::new(&mut self.num_clicks).speed(1.0).clamp_range(1..=1000000));
+                            }
+                        });
+                        ui.horizontal(|ui| {
                             if ui.button("Start").clicked() { self.start(); }
                             if ui.button("Pause").clicked() { self.pause(); }
                             if ui.button("Stop").clicked() { self.stop(); }
@@ -710,6 +603,8 @@ mod tests {
 
 fn main() -> eframe::Result<()> {
     let mut opts = eframe::NativeOptions::default();
+    let _args = Args::parse(); // Arguments will be used later
+
     // Start as a normal window; we resize/position during picking.
     opts.viewport.transparent = Some(true);
     opts.viewport.resizable = Some(true);
@@ -724,4 +619,5 @@ fn main() -> eframe::Result<()> {
             Box::<AppState>::default()
         }),
     )
+
 }

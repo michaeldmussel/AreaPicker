@@ -13,6 +13,7 @@ enigo = "0.1"
 rdev = { version = "0.5", optional = true }
 winit = "0.29"
 display-info = "0.4"
+clap = { version = "4.5.47", features = ["derive"] }
 
 [features]
 hooks = ["rdev"]

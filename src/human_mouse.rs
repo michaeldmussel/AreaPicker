@@ -18,6 +18,9 @@ impl Bounds {
     pub fn nearest_point(&self, (x, y): (i32, i32)) -> (i32, i32) {
         self.clamp((x, y))
     }
+    pub fn width(&self) -> i32 { self.max_x - self.min_x }
+    pub fn height(&self) -> i32 { self.max_y - self.min_y }
+    pub fn is_valid(&self) -> bool { self.width() > 0 && self.height() > 0 }
 }
 
 #[derive(Clone, Debug)]
