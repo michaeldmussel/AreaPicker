@@ -6,6 +6,15 @@ use parking_lot::Mutex;
 use rand::Rng;
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
 
+
+fn to_px(ctx: &egui::Context, p: egui::Pos2) -> (i32, i32) {
+    let ppp = ctx.pixels_per_point();
+    ((p.x * ppp).round() as i32, (p.y * ppp).round() as i32)
+}
+fn rect_pts(ctx: &egui::Context) -> egui::Rect {
+    // screen rect in points (logical)
+    ctx.input(|i| i.screen_rect)
+}
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -136,6 +145,7 @@ impl AppState {
             let mut rng = rand::thread_rng();
             let mut clicks_left = finite_clicks;
             let mut cycles_left = sequence_cycles;
+            let mut last_pos: Option<(i32,i32)> = None;
             
             'outer: while running_clone.load(Ordering::Relaxed) {
                 let cfg = config.lock();
@@ -156,7 +166,12 @@ impl AppState {
                             let x = rng.gen_range(action.bounds.min_x..=action.bounds.max_x);
                             let y = rng.gen_range(action.bounds.min_y..=action.bounds.max_y);
                             
+                            if let Some((lx, ly)) = last_pos {
+                            human_mouse::move_mouse_smooth(&mut enigo, lx, ly, x, y, Duration::from_millis(140), false);
+                        } else {
                             enigo.mouse_move_to(x, y);
+                        }
+                        last_pos = Some((x,y));
                             
                             let button = match action.button {
                                 ClickButton::Left => MouseButton::Left,
@@ -186,7 +201,12 @@ impl AppState {
                         let x = rng.gen_range(bounds.min_x..=bounds.max_x);
                         let y = rng.gen_range(bounds.min_y..=bounds.max_y);
                         
-                        enigo.mouse_move_to(x, y);
+                        if let Some((lx, ly)) = last_pos {
+                            human_mouse::move_mouse_smooth(&mut enigo, lx, ly, x, y, Duration::from_millis(140), false);
+                        } else {
+                            enigo.mouse_move_to(x, y);
+                        }
+                        last_pos = Some((x,y));
                         
                         let button = match cfg.button {
                             ClickButton::Left => MouseButton::Left,
@@ -230,14 +250,15 @@ impl AppState {
         }
     }
 
-    fn bounds_from_drag(&mut self) {
+    fn bounds_from_drag(&mut self, ctx: &egui::Context) {
         if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
-            self.bounds_inputs = [
-                start.x.min(end.x) as i32,
-                start.x.max(end.x) as i32,
-                start.y.min(end.y) as i32,
-                start.y.max(end.y) as i32,
-            ];
+            let (sx, sy) = to_px(ctx, start);
+            let (ex, ey) = to_px(ctx, end);
+            let min_x = sx.min(ex);
+            let max_x = sx.max(ex);
+            let min_y = sy.min(ey);
+            let max_y = sy.max(ey);
+            self.bounds_inputs = [min_x, max_x, min_y, max_y];
             
             // In single area mode, update the config bounds directly
             if !self.config.lock().sequence_mode {
@@ -251,9 +272,14 @@ impl AppState {
         }
     }
 
-    fn get_total_screen_bounds() -> (i32, i32, i32, i32) {
-        // TODO: Add multi-monitor support. For now, we'll just use primary
-        (0, 0, 1920, 1080)
+    fn get_total_screen_bounds(ctx: &egui::Context) -> (i32, i32, i32, i32) {
+        let sr = ctx.input(|i| i.screen_rect);
+        let ppp = ctx.pixels_per_point();
+        let min_x = (sr.min.x * ppp).round() as i32;
+        let min_y = (sr.min.y * ppp).round() as i32;
+        let max_x = (sr.max.x * ppp).round() as i32;
+        let max_y = (sr.max.y * ppp).round() as i32;
+        (min_x, min_y, max_x, max_y)
     }
 }
 
@@ -262,12 +288,9 @@ impl eframe::App for AppState {
         if self.picking_area {
             if self.window_visible {
                 // Get screen dimensions
-                let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
-                let width = max_x - min_x;
-                let height = max_y - min_y;
-                
+                let sr = rect_pts(ctx);
                 // Make window fullscreen and center it
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(width as f32, height as f32)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sr.size()));
                 if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
                     ctx.send_viewport_cmd(cmd);
                 }
@@ -289,7 +312,7 @@ impl eframe::App for AppState {
             ctx.clear_animations();
 
             // Get the screen dimensions and create rect in absolute coordinates
-            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds();
+            let (min_x, min_y, max_x, max_y) = Self::get_total_screen_bounds(ctx);
             let screen_rect = egui::Rect::from_min_max(
                 Pos2::new(min_x as f32, min_y as f32),
                 Pos2::new(max_x as f32, max_y as f32)
@@ -325,7 +348,7 @@ impl eframe::App for AppState {
                     }
                     if response.drag_stopped() {
                         self.drag_end = Some(absolute_pos);
-                        self.bounds_from_drag();
+                        self.bounds_from_drag(ctx);
                         self.picking_area = false;
                         // Restore window to normal state
                         self.window_visible = true;

@@ -1,39 +1,58 @@
 use enigo::MouseControllable;
-use rand::Rng;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Simulates human-like mouse movement using Bézier curves
-pub fn move_mouse_human(enigo: &mut enigo::Enigo, start_x: i32, start_y: i32, end_x: i32, end_y: i32) {
-    let mut rng = rand::thread_rng();
-    
-    // Control points for Bézier curve (creates natural arc)
-    let control1_x = start_x + (end_x - start_x) / 3 + rng.gen_range(-20..=20);
-    let control1_y = start_y + (end_y - start_y) / 3 + rng.gen_range(-20..=20);
-    let control2_x = start_x + 2 * (end_x - start_x) / 3 + rng.gen_range(-20..=20);
-    let control2_y = start_y + 2 * (end_y - start_y) / 3 + rng.gen_range(-20..=20);
+/// Smooth, time-based pointer travel with ease-in-out timing.
+/// This is for UX polish only (not for evading detection).
+pub fn move_mouse_smooth(
+    enigo: &mut enigo::Enigo,
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+    duration: Duration,
+    micro_jitter: bool,
+) {
+    let start = Instant::now();
+    let dx = (end_x - start_x) as f32;
+    let dy = (end_y - start_y) as f32;
 
-    // Number of steps (more steps = smoother but slower movement)
-    let steps = ((((end_x - start_x).pow(2) + (end_y - start_y).pow(2)) as f64).sqrt() / 2.0) as i32;
-    let steps = steps.max(10).min(50); // Minimum 10 steps, maximum 50
+    let mut last_sent = (start_x, start_y);
 
-    for i in 0..=steps {
-        let t = i as f64 / steps as f64;
-        
-        // Cubic Bézier curve formula
-        let x = (1.0 - t).powi(3) * start_x as f64
-            + 3.0 * (1.0 - t).powi(2) * t * control1_x as f64
-            + 3.0 * (1.0 - t) * t.powi(2) * control2_x as f64
-            + t.powi(3) * end_x as f64;
-            
-        let y = (1.0 - t).powi(3) * start_y as f64
-            + 3.0 * (1.0 - t).powi(2) * t * control1_y as f64
-            + 3.0 * (1.0 - t) * t.powi(2) * control2_y as f64
-            + t.powi(3) * end_y as f64;
+    loop {
+        let t = start.elapsed();
+        let done = t >= duration;
+        let u = if done {
+            1.0
+        } else {
+            (t.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+        };
 
-        // Move to calculated position
-        enigo.mouse_move_to(x as i32, y as i32);
-        
-        // Random small delay between movements (5-15ms)
-        std::thread::sleep(Duration::from_millis(rng.gen_range(5..=15)));
+        // ease-in-out cubic
+        let eased = if u < 0.5 {
+            4.0 * u * u * u
+        } else {
+            1.0 - (-2.0 * u + 2.0).powi(3) / 2.0
+        };
+
+        let mut x = start_x as f32 + dx * eased;
+        let mut y = start_y as f32 + dy * eased;
+
+        if micro_jitter && !done {
+            let phase = (t.as_micros() % 10_000) as f32;
+            let j = (phase / 10_000.0 * std::f32::consts::TAU).sin() * 0.4;
+            x += j;
+            y += j;
+        }
+
+        let xi = x.round() as i32;
+        let yi = y.round() as i32;
+
+        if (xi, yi) != last_sent {
+            enigo.mouse_move_to(xi, yi);
+            last_sent = (xi, yi);
+        }
+
+        if done { break; }
+        std::thread::sleep(Duration::from_millis(4));
     }
 }
