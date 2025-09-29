@@ -1,7 +1,11 @@
 mod human_mouse;
 
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
+<<<<<<< Updated upstream
 use enigo::MouseControllable;
+=======
+use enigo::{self, MouseButton, MouseControllable};
+>>>>>>> Stashed changes
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
@@ -49,6 +53,7 @@ struct ClickConfig {
     finite_clicks: Option<u32>,  // None for infinite, Some(n) for n clicks
 }
 
+<<<<<<< Updated upstream
 static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::new()));
 
 impl ClickJob {
@@ -159,6 +164,8 @@ struct Monitor {
 }
 
 
+=======
+>>>>>>> Stashed changes
 fn query_monitors() -> Vec<Monitor> {
     match display_info::DisplayInfo::all() {
         Ok(displays) if !displays.is_empty() => {
@@ -193,6 +200,7 @@ fn query_monitors() -> Vec<Monitor> {
     }
 }
 
+<<<<<<< Updated upstream
 
 fn union_rect(monitors: &[Monitor]) -> (i32, i32, i32, i32) {
     let mut min_x = i32::MAX;
@@ -240,6 +248,36 @@ struct AppState {
     // Engine
     job: Option<ClickJob>,
     config: Arc<Mutex<ClickConfig>>,
+=======
+// -------------- App State --------------
+struct AppState {
+    // Area picking state
+    picking_area: bool,
+    window_visible: bool,
+    drag_start: Option<Pos2>,
+    drag_end: Option<Pos2>,
+
+    // Display state
+    monitors: Vec<Monitor>,
+    display_choice: DisplayChoice,
+    
+    // UI State
+    bounds_inputs: [i32; 4],
+    click_button_left: bool,
+    min_secs: f32,
+    max_secs: f32,
+    finite_clicks: Option<i32>,
+    sequence_cycles: Option<i32>,
+
+    // Sequence editing state
+    editing_sequence: bool,
+    current_sequence_index: usize,
+    sequence_edit_name: String,
+    sequence_edit_clicks: i32,
+
+    config: Arc<Mutex<ClickConfig>>,
+    job: Option<ClickJob>,
+>>>>>>> Stashed changes
 }
 
 impl Default for AppState {
@@ -247,6 +285,10 @@ impl Default for AppState {
         let monitors = query_monitors();
         Self {
             picking_area: false,
+<<<<<<< Updated upstream
+=======
+            window_visible: true,
+>>>>>>> Stashed changes
             drag_start: None,
             drag_end: None,
 
@@ -372,6 +414,7 @@ impl AppState {
         }
     }
 }
+
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
