@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use crate::human_mouse::{HumanMouseSettings, Bounds, human_move_and_click};
-use crate::presets::{PresetStore, UiPreset, NamedPoint, BoundsSerde};
+use crate::presets::{PresetStore, UiPreset, NamedPoint, BoundsSerde, ClickSequence, SequenceStep};
 
 use clap::Parser;
 
@@ -34,12 +34,29 @@ struct Args {
 #[derive(Clone, Copy, Debug)]
 enum ClickButton { Left, Right }
 
-
+/// Represents either a random clicking mode or a sequence mode
+#[derive(Clone, Debug)]
+enum ClickMode {
+    /// Random clicking in an area with min/max intervals
+    Random {
+        bounds: Bounds,
+        button: ClickButton,
+        min_secs: f32,
+        max_secs: f32,
+        finite_clicks: Option<u32>,
+    },
+    /// Execute a predefined sequence of clicks
+    Sequence {
+        sequence: ClickSequence,
+        preset: UiPreset,
+        repeat_count: Option<u32>, // None = infinite, Some(n) = repeat n times
+    },
+}
 
 struct ClickJob {
     running: Arc<AtomicBool>,
-    #[allow(dead_code)] // Used through Arc clone in spawn
-    config: Arc<Mutex<ClickConfig>>,
+    #[allow(dead_code)]
+    mode: Arc<Mutex<ClickMode>>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,12 +70,28 @@ struct ClickConfig {
 
 static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::new()));
 
+/// Helper function to perform interruptible sleep.
+/// Splits the sleep into small chunks (50ms) so the running flag can be checked frequently.
+/// This prevents UI stalling by ensuring the thread can be interrupted quickly.
+fn interruptible_sleep(duration_ms: u64, running: &Arc<AtomicBool>) {
+    use std::time::Duration;
+    let chunk_size = 50u64;
+    for _ in 0..(duration_ms / chunk_size) {
+        if !running.load(Ordering::Relaxed) { break; }
+        std::thread::sleep(Duration::from_millis(chunk_size));
+    }
+    if !running.load(Ordering::Relaxed) { return; }
+    let remainder = duration_ms % chunk_size;
+    if remainder > 0 {
+        std::thread::sleep(Duration::from_millis(remainder));
+    }
+}
+
 impl ClickJob {
-    fn spawn(config: Arc<Mutex<ClickConfig>>) -> Self {
+    fn spawn_random(config: Arc<Mutex<ClickConfig>>) -> Self {
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
         use std::sync::{Arc};
-        use std::time::Duration;
         use rand::Rng;
         use enigo::{MouseButton};
 
@@ -84,11 +117,11 @@ impl ClickJob {
 
                 let cfg = config_clone.lock().clone();
                 let Some(b) = cfg.bounds else {
-                    std::thread::sleep(Duration::from_millis(200));
+                    interruptible_sleep(200, &running_clone);
                     continue;
                 };
                 if !b.is_valid() {
-                    std::thread::sleep(Duration::from_millis(200));
+                    interruptible_sleep(200, &running_clone);
                     continue;
                 }
 
@@ -129,23 +162,128 @@ impl ClickJob {
                     *remaining = remaining.saturating_sub(1);
                 }
 
-                // sleep random between min..max (seconds), while checking stop flag
+                // sleep random between min..max (seconds), with interruptible sleep
                 let (min_s, max_s) = if cfg.min_secs <= cfg.max_secs {
                     (cfg.min_secs, cfg.max_secs)
                 } else { (cfg.max_secs, cfg.min_secs) };
                 let wait = rng.gen_range(min_s..=max_s).max(0.01);
                 let ms = (wait * 1000.0) as u64;
-                for _ in 0..ms/50 {
-                    if !running_clone.load(Ordering::Relaxed) { break; }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if ms % 50 != 0 { std::thread::sleep(Duration::from_millis(ms % 50)); }
+                interruptible_sleep(ms, &running_clone);
             }
         });
 
-        Self { running, config }
+        let mode = Arc::new(Mutex::new(ClickMode::Random {
+            bounds: config.lock().bounds.unwrap_or(Bounds { min_x: 0, max_x: 0, min_y: 0, max_y: 0 }),
+            button: config.lock().button,
+            min_secs: config.lock().min_secs,
+            max_secs: config.lock().max_secs,
+            finite_clicks: config.lock().finite_clicks,
+        }));
+
+        Self { running, mode }
     }
-    fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
+
+    fn spawn_sequence(sequence: ClickSequence, preset: UiPreset, repeat_count: Option<u32>) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc};
+        use rand::Rng;
+        use enigo::{MouseButton};
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+
+        eprintln!("Starting sequence click job: {}", sequence.name);
+        
+        let sequence_clone = sequence.clone();
+        let preset_clone = preset.clone();
+
+        std::thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut last_pos: Option<(i32,i32)> = None;
+            let mut repeats_remaining = repeat_count;
+
+            loop {
+                if !running_clone.load(Ordering::Relaxed) { break; }
+
+                // Check if we've completed finite repeats
+                if let Some(0) = repeats_remaining {
+                    running_clone.store(false, Ordering::Relaxed);
+                    break;
+                }
+
+                // Execute each step in the sequence
+                for step in &sequence_clone.steps {
+                    if !running_clone.load(Ordering::Relaxed) { break; }
+
+                    // Find the area in the preset
+                    if let Some(named_area) = preset_clone.areas.iter().find(|a| a.name == step.area_name) {
+                        let bounds = Bounds {
+                            min_x: named_area.bounds.min_x,
+                            max_x: named_area.bounds.max_x,
+                            min_y: named_area.bounds.min_y,
+                            max_y: named_area.bounds.max_y,
+                        };
+
+                        if !bounds.is_valid() {
+                            eprintln!("Invalid bounds for area {}", step.area_name);
+                            continue;
+                        }
+
+                        // Pick a random point in the area
+                        let x = rng.gen_range(bounds.min_x..=bounds.max_x);
+                        let y = rng.gen_range(bounds.min_y..=bounds.max_y);
+
+                        // Perform the click
+                        {
+                            let mut en = ENIGO.lock();
+                            let from = last_pos.unwrap_or((bounds.min_x - 40, bounds.min_y - 40));
+                            let button = match step.button_type.as_str() {
+                                "Right" => MouseButton::Right,
+                                _ => MouseButton::Left,
+                            };
+
+                            human_move_and_click(
+                                &mut *en,
+                                from,
+                                (x, y),
+                                Some(bounds),
+                                &HumanMouseSettings::default(),
+                                button,
+                            );
+                        }
+
+                        last_pos = Some((x, y));
+                    } else {
+                        eprintln!("Area '{}' not found in preset '{}'", step.area_name, preset_clone.name);
+                    }
+
+                    // Wait before next step (using interruptible sleep)
+                    let ms = (step.interval_secs * 1000.0) as u64;
+                    if ms > 0 {
+                        interruptible_sleep(ms, &running_clone);
+                    }
+                }
+
+                // Update repeat counter
+                if let Some(ref mut remaining) = repeats_remaining {
+                    *remaining = remaining.saturating_sub(1);
+                }
+            }
+        });
+
+        let mode = Arc::new(Mutex::new(ClickMode::Sequence {
+            sequence,
+            preset,
+            repeat_count,
+        }));
+
+        Self { running, mode }
+    }
+
+    fn stop(&self) { 
+        self.running.store(false, Ordering::Relaxed); 
+    }
 }
 
 // -------------- Display Info --------------
@@ -248,9 +386,22 @@ struct AppState {
     selected_preset: Option<String>,
     new_preset_name: String,
 
+    // ---- Areas inside a preset ----
+    selected_area: Option<String>,
+    new_area_name: String,
+
     // ---- Point picking ----
     picking_point: bool,
     new_point_name: String,
+
+    // ---- Sequences ----
+    selected_sequence: Option<String>,
+    new_sequence_name: String,
+    sequence_repeat_count: u32,
+
+    // ---- Window state ----
+    saved_window_pos: Option<egui::Pos2>,
+    saved_window_size: Option<egui::Vec2>,
 }
 
 impl Default for AppState {
@@ -281,12 +432,23 @@ impl Default for AppState {
                 finite_clicks: None,
             })),
 
-            preset_store,
+            preset_store: PresetStore::load_or_default(),
             selected_preset: None,
             new_preset_name: String::new(),
 
+            selected_area: None,
+            new_area_name: "Main".to_string(),
+
             picking_point: false,
-            new_point_name: "Button".to_string(),
+            new_point_name: String::new(),
+
+            selected_sequence: None,
+            new_sequence_name: String::new(),
+            sequence_repeat_count: 1,
+
+            saved_window_pos: None,
+            saved_window_size: None,
+
         }
     }
 }
@@ -294,6 +456,25 @@ impl Default for AppState {
 impl AppState {
     fn start(&mut self) {
         if self.job.is_some() { return; }
+        
+        // Check if we should run a sequence instead of random clicking
+        if let Some(seq_name) = &self.selected_sequence.clone() {
+            if let Some(sequence) = self.preset_store.get_sequence(seq_name) {
+                if let Some(preset_name) = &sequence.preset_name.clone() {
+                    if let Some(preset) = self.preset_store.presets.iter().find(|p| p.name == *preset_name) {
+                        let repeat_count = if self.sequence_repeat_count == 0 { None } else { Some(self.sequence_repeat_count) };
+                        self.job = Some(ClickJob::spawn_sequence(
+                            sequence.clone(),
+                            preset.clone(),
+                            repeat_count
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        
+        // Otherwise, run random clicking
         let mut cfg = self.config.lock();
         cfg.button = if self.click_button_left { ClickButton::Left } else { ClickButton::Right };
         cfg.min_secs = self.min_secs;
@@ -306,7 +487,7 @@ impl AppState {
             max_y: self.bounds_inputs[3],
         });
         drop(cfg);
-        self.job = Some(ClickJob::spawn(Arc::clone(&self.config)));
+        self.job = Some(ClickJob::spawn_random(Arc::clone(&self.config)));
     }
 
     fn stop(&mut self) {
@@ -333,6 +514,16 @@ impl AppState {
         self.drag_start = None;
         self.drag_end = None;
         self.picking_area = true;
+
+        // Save current window position and size before fullscreen
+        ctx.input(|i| {
+            if let Some(outer_rect) = i.viewport().outer_rect {
+                self.saved_window_pos = Some(outer_rect.left_top());
+            }
+            if let Some(inner_rect) = i.viewport().inner_rect {
+                self.saved_window_size = Some(inner_rect.size());
+            }
+        });
 
         // choose target rectangle in PHYSICAL pixels
         let (origin_px, size_px) = match self.display_choice {
@@ -366,10 +557,18 @@ impl AppState {
 
     fn exit_picker(&mut self, ctx: &egui::Context) {
         self.picking_area = false;
-        // restore a comfy window
+        // restore a comfy window with saved position and size
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::Normal));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(520.0, 380.0)));
+        
+        // Restore saved size, or use default
+        let size = self.saved_window_size.unwrap_or(egui::vec2(700.0, 450.0));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        
+        // Restore saved position, or use default
+        if let Some(pos) = self.saved_window_pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
     }
 
     /// Convert current drag (logical points in current window) into PHYSICAL pixel bounds,
@@ -391,12 +590,16 @@ impl AppState {
         }
     }
 
-        fn apply_preset_bounds(&mut self, preset: &UiPreset) {
-        if let Some(b) = preset.bounds {
-            self.bounds_inputs = [b.min_x, b.max_x, b.min_y, b.max_y];
-            self.config.lock().bounds = Some(Bounds { min_x: b.min_x, max_x: b.max_x, min_y: b.min_y, max_y: b.max_y });
-        }
-    }
+    fn apply_boundsserde(&mut self, b: BoundsSerde) {
+        self.bounds_inputs = [b.min_x, b.max_x, b.min_y, b.max_y];
+        self.config.lock().bounds = Some(Bounds {
+            min_x: b.min_x,
+            max_x: b.max_x,
+            min_y: b.min_y,
+            max_y: b.max_y,
+        });
+}
+
 }
 
 impl eframe::App for AppState {
@@ -517,9 +720,12 @@ impl eframe::App for AppState {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.vertical(|ui| {
-                    ui.group(|ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.vertical(|ui| {
+                        ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label("Target display:");
                             egui::ComboBox::from_id_source("display_select")
@@ -574,7 +780,10 @@ impl eframe::App for AppState {
                             if ui.button("Load bounds").clicked() {
                                 if let Some(sel) = self.selected_preset.clone() {
                                     if let Some(p) = self.preset_store.presets.iter().find(|p| p.name == sel) {
-                                        self.apply_preset_bounds(p);
+                                        // Load first area's bounds if available
+                                        if let Some(area) = p.areas.first() {
+                                            self.apply_boundsserde(area.bounds);
+                                        }
                                     }
                                 }
                             }
@@ -582,7 +791,16 @@ impl eframe::App for AppState {
                             if ui.button("Save bounds to preset").clicked() {
                                 if let Some(sel) = self.selected_preset.clone() {
                                     if let Some(p) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
-                                        p.bounds = Some(BoundsSerde::from_inputs(self.bounds_inputs));
+                                        // Add or update "bounds" area from current bounds_inputs
+                                        let bounds_area = crate::presets::NamedArea {
+                                            name: "bounds".to_string(),
+                                            bounds: BoundsSerde::from_inputs(self.bounds_inputs),
+                                        };
+                                        if let Some(existing) = p.areas.iter_mut().find(|a| a.name == "bounds") {
+                                            existing.bounds = bounds_area.bounds;
+                                        } else {
+                                            p.areas.push(bounds_area);
+                                        }
                                         let _ = self.preset_store.save();
                                     }
                                 }
@@ -609,7 +827,7 @@ impl eframe::App for AppState {
                                 if !name.is_empty() {
                                     let preset = UiPreset {
                                         name: name.to_string(),
-                                        bounds: Some(BoundsSerde::from_inputs(self.bounds_inputs)),
+                                        areas: vec![],
                                         points: vec![],
                                     };
                                     self.preset_store.upsert_preset(preset);
@@ -621,7 +839,158 @@ impl eframe::App for AppState {
                         });
 
                         ui.separator();
+                        ui.group(|ui| {
+                            ui.label("UI Presets");
 
+                            // ---------- Preset selector ----------
+                            let selected_text = self.selected_preset.clone().unwrap_or_else(|| "None".into());
+                            egui::ComboBox::from_id_source("preset_select")
+                                .selected_text(selected_text)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.selected_preset, None, "None");
+                                    for p in &self.preset_store.presets {
+                                        ui.selectable_value(&mut self.selected_preset, Some(p.name.clone()), &p.name);
+                                    }
+                                });
+
+                            // If preset changed, clear area selection (simple + avoids mismatches)
+                            // (If you already track last preset, use that; otherwise do this conservatively.)
+                            if self.selected_preset.is_none() {
+                                self.selected_area = None;
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.label("New preset:");
+                                ui.text_edit_singleline(&mut self.new_preset_name);
+
+                                if ui.button("Create").clicked() {
+                                    let name = self.new_preset_name.trim();
+                                    if !name.is_empty() {
+                                        let preset = UiPreset {
+                                            name: name.to_string(),
+                                            areas: vec![],
+                                            points: vec![],
+                                        };
+                                        self.preset_store.upsert_preset(preset);
+                                        self.selected_preset = Some(name.to_string());
+                                        self.selected_area = None;
+                                        self.new_preset_name.clear();
+                                        let _ = self.preset_store.save();
+                                    }
+                                }
+
+                                if ui.button("Delete preset").clicked() {
+                                    if let Some(sel) = self.selected_preset.clone() {
+                                        self.preset_store.remove_by_name(&sel);
+                                        self.selected_preset = None;
+                                        self.selected_area = None;
+                                        let _ = self.preset_store.save();
+                                    }
+                                }
+                            });
+
+                            ui.separator();
+                            ui.label("Areas (named rectangles)");
+
+                            // ---------- Area section ----------
+                            if let Some(pname) = self.selected_preset.clone() {
+                                // Area dropdown
+                                let area_names: Vec<String> = self.preset_store.presets.iter()
+                                    .find(|p| p.name == pname)
+                                    .map(|p| p.areas.iter().map(|a| a.name.clone()).collect())
+                                    .unwrap_or_default();
+
+                                let area_selected_text = self.selected_area.clone().unwrap_or_else(|| "None".into());
+                                egui::ComboBox::from_id_source("area_select")
+                                    .selected_text(area_selected_text)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.selected_area, None, "None");
+                                        for a_name in &area_names {
+                                            ui.selectable_value(&mut self.selected_area, Some(a_name.clone()), a_name);
+                                        }
+                                    });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("New area name:");
+                                    ui.text_edit_singleline(&mut self.new_area_name);
+
+                                    if ui.button("Add area from current bounds").clicked() {
+                                        let aname = self.new_area_name.trim().to_string();
+                                        if !aname.is_empty() {
+                                            if let Some(preset) = self.preset_store.presets.iter_mut().find(|p| p.name == pname) {
+                                                let area = crate::presets::NamedArea {
+                                                    name: aname.clone(),
+                                                    bounds: crate::presets::BoundsSerde::from_inputs(self.bounds_inputs),
+                                                };
+                                                if let Some(existing) = preset.areas.iter_mut().find(|x| x.name == aname) {
+                                                    *existing = area;
+                                                } else {
+                                                    preset.areas.push(area);
+                                                }
+                                                preset.areas.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                                                self.selected_area = Some(aname);
+                                                let _ = self.preset_store.save();
+                                            }
+                                        }
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    let has_area = self.selected_area.is_some();
+
+                                    if ui.add_enabled(has_area, egui::Button::new("Load area → bounds")).clicked() {
+                                        if let Some(aname) = self.selected_area.clone() {
+                                            if let Some(preset) = self.preset_store.presets.iter().find(|p| p.name == pname) {
+                                                if let Some(a) = preset.areas.iter().find(|x| x.name == aname) {
+                                                    self.apply_boundsserde(a.bounds);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if ui.add_enabled(has_area, egui::Button::new("Save bounds → area")).clicked() {
+                                        if let Some(aname) = self.selected_area.clone() {
+                                            if let Some(preset) = self.preset_store.presets.iter_mut().find(|p| p.name == pname.clone()) {
+                                                if let Some(a) = preset.areas.iter_mut().find(|x| x.name == aname) {
+                                                    a.bounds = crate::presets::BoundsSerde::from_inputs(self.bounds_inputs);
+                                                    let _ = self.preset_store.save();
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if ui.add_enabled(has_area, egui::Button::new("Delete area")).clicked() {
+                                        if let Some(aname) = self.selected_area.clone() {
+                                            if let Some(preset) = self.preset_store.presets.iter_mut().find(|p| p.name == pname.clone()) {
+                                                preset.areas.retain(|x| x.name != aname);
+                                                self.selected_area = None;
+                                                let _ = self.preset_store.save();
+                                            }
+                                        }
+                                    }
+                                });
+
+                                // Quick list view
+                                ui.separator();
+                                ui.label("Areas in this preset:");
+                                if let Some(preset) = self.preset_store.presets.iter().find(|p| p.name == pname) {
+                                    for a in &preset.areas {
+                                        ui.monospace(format!(
+                                            "{}: min({}, {}) max({}, {})",
+                                            a.name, a.bounds.min_x, a.bounds.min_y, a.bounds.max_x, a.bounds.max_y
+                                        ));
+                                    }
+                                }
+                            } else {
+                                ui.monospace("Select a preset to manage areas.");
+                            }
+                        });
+
+
+
+                        
+                        ui.separator();
+                        
                         // Points
                         ui.label("Named points (for button locations)");
                         ui.horizontal(|ui| {
@@ -638,14 +1007,19 @@ impl eframe::App for AppState {
 
                         // show existing points
                         if let Some(sel) = self.selected_preset.clone() {
-                            if let Some(p) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
-                                for i in (0..p.points.len()).rev() {
-                                    let pt = &p.points[i];
+                            if let Some(p) = self.preset_store.presets.iter().find(|p| p.name == sel) {
+                                let point_names: Vec<(String, i32, i32)> = p.points.iter()
+                                    .map(|pt| (pt.name.clone(), pt.x, pt.y))
+                                    .collect();
+                                
+                                for (i, (pt_name, x, y)) in point_names.iter().enumerate() {
                                     ui.horizontal(|ui| {
-                                        ui.monospace(format!("{}: ({}, {})", pt.name, pt.x, pt.y));
+                                        ui.monospace(format!("{}: ({}, {})", pt_name, x, y));
                                         if ui.button("✕").clicked() {
-                                            p.points.remove(i);
-                                            let _ = self.preset_store.save();
+                                            if let Some(preset) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
+                                                preset.points.remove(i);
+                                                let _ = self.preset_store.save();
+                                            }
                                         }
                                     });
                                 }
@@ -690,7 +1064,121 @@ impl eframe::App for AppState {
                             ui.label("Status: Stopped");
                         }
                     });
-                });
+
+                    ui.separator();
+
+                    ui.group(|ui| {
+                        ui.label("Click Sequences");
+
+                        // Sequence selector
+                        let selected_text = self.selected_sequence.clone().unwrap_or_else(|| "None".into());
+                        egui::ComboBox::from_id_source("sequence_select")
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.selected_sequence, None, "None");
+                                for s in &self.preset_store.sequences {
+                                    ui.selectable_value(&mut self.selected_sequence, Some(s.name.clone()), &s.name);
+                                }
+                            });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Load sequence").clicked() {
+                                // Nothing to do here; sequence is already loaded when Start is clicked
+                                eprintln!("Sequence selected, ready to run");
+                            }
+
+                            if ui.button("Delete sequence").clicked() {
+                                if let Some(sel) = self.selected_sequence.clone() {
+                                    self.preset_store.remove_sequence_by_name(&sel);
+                                    let _ = self.preset_store.save();
+                                    self.selected_sequence = None;
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        // Create new sequence
+                        ui.horizontal(|ui| {
+                            ui.label("New sequence name:");
+                            ui.text_edit_singleline(&mut self.new_sequence_name);
+
+                            let can_create = !self.new_sequence_name.trim().is_empty() && self.selected_preset.is_some();
+                            if ui.add_enabled(can_create, egui::Button::new("Create from preset areas")).clicked() {
+                                let name = self.new_sequence_name.trim().to_string();
+                                let preset_name = self.selected_preset.clone().unwrap();
+                                if let Some(preset) = self.preset_store.presets.iter().find(|p| p.name == preset_name) {
+                                    // Create a sequence with one step per area
+                                    let steps = preset.areas.iter().map(|a| SequenceStep {
+                                        area_name: a.name.clone(),
+                                        interval_secs: 2.0,
+                                        button_type: "Left".to_string(),
+                                    }).collect();
+                                    
+                                    let sequence = ClickSequence {
+                                        name: name.clone(),
+                                        preset_name: Some(preset_name),
+                                        steps,
+                                    };
+                                    
+                                    self.preset_store.upsert_sequence(sequence);
+                                    let _ = self.preset_store.save();
+                                    self.new_sequence_name.clear();
+                                    self.selected_sequence = Some(name);
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        ui.label("Sequence repeat count (0 = infinite):");
+                        ui.add(egui::Slider::new(&mut self.sequence_repeat_count, 0..=1000));
+
+                        ui.separator();
+
+                        // Edit current sequence steps
+                        if let Some(sel) = self.selected_sequence.clone() {
+                            // Collect step info to avoid borrow issues
+                            let step_info: Vec<(String, f32, String)> = self.preset_store.get_sequence(&sel)
+                                .map(|s| s.steps.iter().map(|st| (st.area_name.clone(), st.interval_secs, st.button_type.clone())).collect())
+                                .unwrap_or_default();
+                            
+                            if !step_info.is_empty() {
+                                ui.label(format!("Editing sequence: {}", sel));
+                                ui.label("Steps:");
+                                
+                                for (i, (area_name, _interval, _button)) in step_info.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Step {}: {} ", i + 1, area_name));
+                                        
+                                        if let Some(seq_mut) = self.preset_store.get_sequence_mut(&sel) {
+                                            if let Some(step) = seq_mut.steps.get_mut(i) {
+                                                ui.label("Interval (s):");
+                                                ui.add(egui::DragValue::new(&mut step.interval_secs).speed(0.1));
+                                                ui.label("Button:");
+                                                let mut button_str = step.button_type.clone();
+                                                if ui.selectable_value(&mut button_str, "Left".to_string(), "Left").changed() {
+                                                    step.button_type = button_str.clone();
+                                                }
+                                                if ui.selectable_value(&mut button_str, "Right".to_string(), "Right").changed() {
+                                                    step.button_type = button_str;
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                
+                                if ui.button("Save sequence changes").clicked() {
+                                    let _ = self.preset_store.save();
+                                }
+                            } else {
+                                ui.monospace("No steps in selected sequence.");
+                            }
+                        } else {
+                            ui.monospace("Select a sequence to edit.");
+                        }
+                    });
+                        });
+                    });
             });
 
             // Preview rectangle
