@@ -1,4 +1,5 @@
 mod human_mouse;
+mod presets;
 
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
 use enigo::MouseControllable;
@@ -6,6 +7,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use crate::human_mouse::{HumanMouseSettings, Bounds, human_move_and_click};
+use crate::presets::{PresetStore, UiPreset, NamedPoint, BoundsSerde};
 
 use clap::Parser;
 
@@ -240,11 +242,21 @@ struct AppState {
     // Engine
     job: Option<ClickJob>,
     config: Arc<Mutex<ClickConfig>>,
+
+    // ---- Presets ----
+    preset_store: PresetStore,
+    selected_preset: Option<String>,
+    new_preset_name: String,
+
+    // ---- Point picking ----
+    picking_point: bool,
+    new_point_name: String,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         let monitors = query_monitors();
+        let preset_store = PresetStore::load_or_default();
         Self {
             picking_area: false,
             drag_start: None,
@@ -268,6 +280,13 @@ impl Default for AppState {
                 max_secs: 4.5,
                 finite_clicks: None,
             })),
+
+            preset_store,
+            selected_preset: None,
+            new_preset_name: String::new(),
+
+            picking_point: false,
+            new_point_name: "Button".to_string(),
         }
     }
 }
@@ -371,6 +390,13 @@ impl AppState {
             eprintln!("Selected bounds (px): x=[{}..{}], y=[{}..{}]", min_x, max_x, min_y, max_y);
         }
     }
+
+        fn apply_preset_bounds(&mut self, preset: &UiPreset) {
+        if let Some(b) = preset.bounds {
+            self.bounds_inputs = [b.min_x, b.max_x, b.min_y, b.max_y];
+            self.config.lock().bounds = Some(Bounds { min_x: b.min_x, max_x: b.max_x, min_y: b.min_y, max_y: b.max_y });
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -429,6 +455,62 @@ impl eframe::App for AppState {
             return; // Skip main UI while picking
         }
 
+                // -------- Point Picker Overlay --------
+        if self.picking_point {
+            let screen_rect = ctx.screen_rect();
+            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("point_picker"));
+            let painter = egui::Painter::new(ctx.clone(), layer_id, egui::Rect::EVERYTHING);
+
+            painter.rect_filled(
+                screen_rect,
+                0.0,
+                Color32::from_rgba_premultiplied(128, 128, 128, 100),
+            );
+
+            egui::Area::new(egui::Id::new("point_picker_area"))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let resp = ui.allocate_rect(screen_rect, Sense::click());
+
+                    if resp.clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            // Convert to PHYSICAL pixels and add correct origin like you do for bounds.
+                            let origin_px = match self.display_choice {
+                                DisplayChoice::All => {
+                                    let (min_x, min_y, _max_x, _max_y) = union_rect(&self.monitors);
+                                    (min_x, min_y)
+                                }
+                                DisplayChoice::One(i) => {
+                                    self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0))
+                                }
+                            };
+
+                            let ppp = ctx.pixels_per_point().max(0.1);
+                            let x = (pos.x * ppp).round() as i32 + origin_px.0;
+                            let y = (pos.y * ppp).round() as i32 + origin_px.1;
+
+                            // Add point to selected preset
+                            if let Some(sel) = self.selected_preset.clone() {
+                                if let Some(p) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
+                                    p.points.push(NamedPoint {
+                                        name: self.new_point_name.trim().to_string(),
+                                        x,
+                                        y,
+                                    });
+                                    let _ = self.preset_store.save();
+                                }
+                            }
+
+                            self.picking_point = false;
+                            self.exit_picker(ctx); // re-use your window restore logic
+                        }
+                    }
+                });
+
+            ctx.request_repaint();
+            return;
+        }
+
         // -------- Main UI --------
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("Area Clicker — Multi-Display");
@@ -469,6 +551,107 @@ impl eframe::App for AppState {
 
                         if ui.button("Pick Area (drag a rectangle)").clicked() {
                             self.enter_picker(ctx);
+                        }
+                    });
+
+                                        ui.separator();
+
+                    ui.group(|ui| {
+                        ui.label("UI Presets");
+
+                        // Dropdown
+                        let selected_text = self.selected_preset.clone().unwrap_or_else(|| "None".into());
+                        egui::ComboBox::from_id_source("preset_select")
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.selected_preset, None, "None");
+                                for p in &self.preset_store.presets {
+                                    ui.selectable_value(&mut self.selected_preset, Some(p.name.clone()), &p.name);
+                                }
+                            });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Load bounds").clicked() {
+                                if let Some(sel) = self.selected_preset.clone() {
+                                    if let Some(p) = self.preset_store.presets.iter().find(|p| p.name == sel) {
+                                        self.apply_preset_bounds(p);
+                                    }
+                                }
+                            }
+
+                            if ui.button("Save bounds to preset").clicked() {
+                                if let Some(sel) = self.selected_preset.clone() {
+                                    if let Some(p) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
+                                        p.bounds = Some(BoundsSerde::from_inputs(self.bounds_inputs));
+                                        let _ = self.preset_store.save();
+                                    }
+                                }
+                            }
+
+                            if ui.button("Delete preset").clicked() {
+                                if let Some(sel) = self.selected_preset.clone() {
+                                    self.preset_store.remove_by_name(&sel);
+                                    self.selected_preset = None;
+                                    let _ = self.preset_store.save();
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        // Create preset
+                        ui.horizontal(|ui| {
+                            ui.label("New preset name:");
+                            ui.text_edit_singleline(&mut self.new_preset_name);
+
+                            if ui.button("Create from current bounds").clicked() {
+                                let name = self.new_preset_name.trim();
+                                if !name.is_empty() {
+                                    let preset = UiPreset {
+                                        name: name.to_string(),
+                                        bounds: Some(BoundsSerde::from_inputs(self.bounds_inputs)),
+                                        points: vec![],
+                                    };
+                                    self.preset_store.upsert_preset(preset);
+                                    self.selected_preset = Some(name.to_string());
+                                    self.new_preset_name.clear();
+                                    let _ = self.preset_store.save();
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        // Points
+                        ui.label("Named points (for button locations)");
+                        ui.horizontal(|ui| {
+                            ui.label("Point name:");
+                            ui.text_edit_singleline(&mut self.new_point_name);
+
+                            let can_pick = self.selected_preset.is_some() && !self.new_point_name.trim().is_empty();
+                            if ui.add_enabled(can_pick, egui::Button::new("Pick point")).clicked() {
+                                // reuse picker window behavior (fullscreen borderless)
+                                self.picking_point = true;
+                                self.enter_picker(ctx);
+                            }
+                        });
+
+                        // show existing points
+                        if let Some(sel) = self.selected_preset.clone() {
+                            if let Some(p) = self.preset_store.presets.iter_mut().find(|p| p.name == sel) {
+                                for i in (0..p.points.len()).rev() {
+                                    let pt = &p.points[i];
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(format!("{}: ({}, {})", pt.name, pt.x, pt.y));
+                                        if ui.button("✕").clicked() {
+                                            p.points.remove(i);
+                                            let _ = self.preset_store.save();
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            ui.monospace("Select a preset to add points.");
                         }
                     });
 
