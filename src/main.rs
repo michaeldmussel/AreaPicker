@@ -426,8 +426,8 @@ impl eframe::App for AppState {
                                     self.editing_sequence = true;
                                     self.bounds_inputs = [100, 400, 100, 400];
                                     self.click_button_left = true;
-                                    self.min_secs = 1.0;
-                                    self.max_secs = 3.0;
+                                    self.min_secs = 0.8;
+                                    self.max_secs = 1.4;
                                     self.sequence_edit_name = format!("Step {}", self.current_sequence_index + 1);
                                     self.sequence_edit_clicks = 1;
                                 }
