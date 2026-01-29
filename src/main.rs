@@ -550,7 +550,7 @@ impl AppState {
         let inner = egui::vec2(size_px.0 as f32 / ppp, size_px.1 as f32 / ppp);
         let outer = egui::pos2(origin_px.0 as f32 / ppp, origin_px.1 as f32 / ppp);
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));  // EXPLICITLY enable transparency for picking
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer));
@@ -560,7 +560,8 @@ impl AppState {
 
     fn exit_picker(&mut self, ctx: &egui::Context) {
         self.picking_area = false;
-        // restore a comfy window with saved position and size
+        // Restore window to normal state (not transparent, with decorations)
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));  // EXPLICITLY disable transparency
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::Normal));
         
@@ -1148,34 +1149,48 @@ impl eframe::App for AppState {
                                 ui.label("Steps:");
                                 
                                 for (i, (area_name, _min, _max, _interval, _button)) in step_info.iter().enumerate() {
-                                    ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
                                         ui.label(format!("Step {}: {} ", i + 1, area_name));
                                         
                                         if let Some(seq_mut) = self.preset_store.get_sequence_mut(&sel) {
                                             if let Some(step) = seq_mut.steps.get_mut(i) {
-                                                // Min interval
-                                                ui.label("Min (s):");
-                                                ui.add(egui::DragValue::new(&mut step.min_interval).speed(0.05));
+                                                // Min interval section
+                                                ui.label("Min Interval:");
+                                                ui.horizontal(|ui| {
+                                                    // Vertical button stack
+                                                    ui.vertical(|ui| {
+                                                        if ui.button("◀ 50ms").clicked() { step.min_interval = (step.min_interval - 0.05).max(0.05); }
+                                                        if ui.button("◀ 1s").clicked() { step.min_interval = (step.min_interval - 1.0).max(0.05); }
+                                                        if ui.button("◀ 5s").clicked() { step.min_interval = (step.min_interval - 5.0).max(0.05); }
+                                                    });
+                                                    // Large value display
+                                                    ui.add(egui::DragValue::new(&mut step.min_interval).speed(0.05));
+                                                    // Vertical button stack
+                                                    ui.vertical(|ui| {
+                                                        if ui.button("50ms ▶").clicked() { step.min_interval += 0.05; }
+                                                        if ui.button("1s ▶").clicked() { step.min_interval += 1.0; }
+                                                        if ui.button("5s ▶").clicked() { step.min_interval += 5.0; }
+                                                    });
+                                                });
                                                 
-                                                // Arrow buttons for min
-                                                if ui.button("◀ 50ms").clicked() { step.min_interval = (step.min_interval - 0.05).max(0.05); }
-                                                if ui.button("◀ 1s").clicked() { step.min_interval = (step.min_interval - 1.0).max(0.05); }
-                                                if ui.button("◀ 5s").clicked() { step.min_interval = (step.min_interval - 5.0).max(0.05); }
-                                                if ui.button("50ms ▶").clicked() { step.min_interval += 0.05; }
-                                                if ui.button("1s ▶").clicked() { step.min_interval += 1.0; }
-                                                if ui.button("5s ▶").clicked() { step.min_interval += 5.0; }
-                                                
-                                                // Max interval
-                                                ui.label("Max (s):");
-                                                ui.add(egui::DragValue::new(&mut step.max_interval).speed(0.05));
-                                                
-                                                // Arrow buttons for max
-                                                if ui.button("◀ 50ms").clicked() { step.max_interval = (step.max_interval - 0.05).max(0.05); }
-                                                if ui.button("◀ 1s").clicked() { step.max_interval = (step.max_interval - 1.0).max(0.05); }
-                                                if ui.button("◀ 5s").clicked() { step.max_interval = (step.max_interval - 5.0).max(0.05); }
-                                                if ui.button("50ms ▶").clicked() { step.max_interval += 0.05; }
-                                                if ui.button("1s ▶").clicked() { step.max_interval += 1.0; }
-                                                if ui.button("5s ▶").clicked() { step.max_interval += 5.0; }
+                                                // Max interval section
+                                                ui.label("Max Interval:");
+                                                ui.horizontal(|ui| {
+                                                    // Vertical button stack
+                                                    ui.vertical(|ui| {
+                                                        if ui.button("◀ 50ms").clicked() { step.max_interval = (step.max_interval - 0.05).max(0.05); }
+                                                        if ui.button("◀ 1s").clicked() { step.max_interval = (step.max_interval - 1.0).max(0.05); }
+                                                        if ui.button("◀ 5s").clicked() { step.max_interval = (step.max_interval - 5.0).max(0.05); }
+                                                    });
+                                                    // Large value display
+                                                    ui.add(egui::DragValue::new(&mut step.max_interval).speed(0.05));
+                                                    // Vertical button stack
+                                                    ui.vertical(|ui| {
+                                                        if ui.button("50ms ▶").clicked() { step.max_interval += 0.05; }
+                                                        if ui.button("1s ▶").clicked() { step.max_interval += 1.0; }
+                                                        if ui.button("5s ▶").clicked() { step.max_interval += 5.0; }
+                                                    });
+                                                });
                                                 
                                                 ui.label("Button:");
                                                 let mut button_str = step.button_type.clone();
@@ -1185,6 +1200,8 @@ impl eframe::App for AppState {
                                                 if ui.selectable_value(&mut button_str, "Right".to_string(), "Right").changed() {
                                                     step.button_type = button_str;
                                                 }
+                                                
+                                                ui.separator();
                                             }
                                         }
                                     });
