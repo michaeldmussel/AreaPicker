@@ -39,7 +39,12 @@ pub struct ClickSequence {
 pub struct SequenceStep {
     /// Name of the area to click in (must exist in the referenced preset)
     pub area_name: String,
-    /// Interval in seconds before this click (from previous step)
+    /// Minimum interval in seconds before this click (from previous step)
+    pub min_interval: f32,
+    /// Maximum interval in seconds before this click (from previous step)
+    pub max_interval: f32,
+    /// Exact interval in seconds before this click (will be randomized between min/max)
+    #[serde(default)]
     pub interval_secs: f32,
     /// Button type: "Left" or "Right"
     #[serde(default)]

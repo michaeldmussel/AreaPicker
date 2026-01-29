@@ -258,8 +258,13 @@ impl ClickJob {
                         eprintln!("Area '{}' not found in preset '{}'", step.area_name, preset_clone.name);
                     }
 
-                    // Wait before next step (using interruptible sleep)
-                    let ms = (step.interval_secs * 1000.0) as u64;
+                    // Wait before next step (randomize between min and max, using interruptible sleep)
+                    let interval_secs = if step.max_interval > step.min_interval {
+                        rng.gen_range(step.min_interval..=step.max_interval)
+                    } else {
+                        step.min_interval
+                    };
+                    let ms = (interval_secs * 1000.0) as u64;
                     if ms > 0 {
                         interruptible_sleep(ms, &running_clone);
                     }
@@ -397,7 +402,6 @@ struct AppState {
     // ---- Sequences ----
     selected_sequence: Option<String>,
     new_sequence_name: String,
-    sequence_repeat_count: u32,
 
     // ---- Window state ----
     saved_window_pos: Option<egui::Pos2>,
@@ -444,7 +448,6 @@ impl Default for AppState {
 
             selected_sequence: None,
             new_sequence_name: String::new(),
-            sequence_repeat_count: 1,
 
             saved_window_pos: None,
             saved_window_size: None,
@@ -462,7 +465,7 @@ impl AppState {
             if let Some(sequence) = self.preset_store.get_sequence(seq_name) {
                 if let Some(preset_name) = &sequence.preset_name.clone() {
                     if let Some(preset) = self.preset_store.presets.iter().find(|p| p.name == *preset_name) {
-                        let repeat_count = if self.sequence_repeat_count == 0 { None } else { Some(self.sequence_repeat_count) };
+                        let repeat_count = Some(1); // Execute sequence once per click
                         self.job = Some(ClickJob::spawn_sequence(
                             sequence.clone(),
                             preset.clone(),
@@ -1111,7 +1114,9 @@ impl eframe::App for AppState {
                                     // Create a sequence with one step per area
                                     let steps = preset.areas.iter().map(|a| SequenceStep {
                                         area_name: a.name.clone(),
-                                        interval_secs: 2.0,
+                                        min_interval: 1.0,
+                                        max_interval: 2.0,
+                                        interval_secs: 1.5,
                                         button_type: "Left".to_string(),
                                     }).collect();
                                     
@@ -1130,30 +1135,48 @@ impl eframe::App for AppState {
                         });
 
                         ui.separator();
-                        ui.label("Sequence repeat count (0 = infinite):");
-                        ui.add(egui::Slider::new(&mut self.sequence_repeat_count, 0..=1000));
-
-                        ui.separator();
 
                         // Edit current sequence steps
                         if let Some(sel) = self.selected_sequence.clone() {
                             // Collect step info to avoid borrow issues
-                            let step_info: Vec<(String, f32, String)> = self.preset_store.get_sequence(&sel)
-                                .map(|s| s.steps.iter().map(|st| (st.area_name.clone(), st.interval_secs, st.button_type.clone())).collect())
+                            let step_info: Vec<(String, f32, f32, f32, String)> = self.preset_store.get_sequence(&sel)
+                                .map(|s| s.steps.iter().map(|st| (st.area_name.clone(), st.min_interval, st.max_interval, st.interval_secs, st.button_type.clone())).collect())
                                 .unwrap_or_default();
                             
                             if !step_info.is_empty() {
                                 ui.label(format!("Editing sequence: {}", sel));
                                 ui.label("Steps:");
                                 
-                                for (i, (area_name, _interval, _button)) in step_info.iter().enumerate() {
+                                for (i, (area_name, _min, _max, _interval, _button)) in step_info.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         ui.label(format!("Step {}: {} ", i + 1, area_name));
                                         
                                         if let Some(seq_mut) = self.preset_store.get_sequence_mut(&sel) {
                                             if let Some(step) = seq_mut.steps.get_mut(i) {
-                                                ui.label("Interval (s):");
-                                                ui.add(egui::DragValue::new(&mut step.interval_secs).speed(0.1));
+                                                // Min interval
+                                                ui.label("Min (s):");
+                                                ui.add(egui::DragValue::new(&mut step.min_interval).speed(0.05));
+                                                
+                                                // Arrow buttons for min
+                                                if ui.button("◀ 50ms").clicked() { step.min_interval = (step.min_interval - 0.05).max(0.05); }
+                                                if ui.button("◀ 1s").clicked() { step.min_interval = (step.min_interval - 1.0).max(0.05); }
+                                                if ui.button("◀ 5s").clicked() { step.min_interval = (step.min_interval - 5.0).max(0.05); }
+                                                if ui.button("50ms ▶").clicked() { step.min_interval += 0.05; }
+                                                if ui.button("1s ▶").clicked() { step.min_interval += 1.0; }
+                                                if ui.button("5s ▶").clicked() { step.min_interval += 5.0; }
+                                                
+                                                // Max interval
+                                                ui.label("Max (s):");
+                                                ui.add(egui::DragValue::new(&mut step.max_interval).speed(0.05));
+                                                
+                                                // Arrow buttons for max
+                                                if ui.button("◀ 50ms").clicked() { step.max_interval = (step.max_interval - 0.05).max(0.05); }
+                                                if ui.button("◀ 1s").clicked() { step.max_interval = (step.max_interval - 1.0).max(0.05); }
+                                                if ui.button("◀ 5s").clicked() { step.max_interval = (step.max_interval - 5.0).max(0.05); }
+                                                if ui.button("50ms ▶").clicked() { step.max_interval += 0.05; }
+                                                if ui.button("1s ▶").clicked() { step.max_interval += 1.0; }
+                                                if ui.button("5s ▶").clicked() { step.max_interval += 5.0; }
+                                                
                                                 ui.label("Button:");
                                                 let mut button_str = step.button_type.clone();
                                                 if ui.selectable_value(&mut button_str, "Left".to_string(), "Left").changed() {
