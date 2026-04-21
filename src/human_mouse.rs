@@ -1,6 +1,7 @@
 use enigo::{MouseControllable, MouseButton};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::{thread, time::Duration};
 
 #[derive(Clone, Copy, Debug)]
@@ -129,14 +130,39 @@ fn maybe_overshoot(to: (i32,i32), from: (i32,i32), settings: &HumanMouseSettings
 }
 
 /// Move the mouse like a human: smooth path, velocity bell curve, jitter, pauses, optional overshoot.
-pub fn human_move_and_click(
+fn interruptible_sleep(duration_ms: u64, running: &Arc<AtomicBool>, paused: &Arc<AtomicBool>) -> bool {
+    let chunk_ms = 10;
+    let mut remaining = duration_ms;
+
+    while remaining > 0 {
+        if !running.load(Ordering::Relaxed) {
+            return false;
+        }
+        while paused.load(Ordering::Relaxed) {
+            if !running.load(Ordering::Relaxed) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(chunk_ms));
+        }
+
+        let sleep_ms = remaining.min(chunk_ms);
+        thread::sleep(Duration::from_millis(sleep_ms));
+        remaining -= sleep_ms;
+    }
+
+    running.load(Ordering::Relaxed)
+}
+
+pub fn human_move_and_click_interruptible(
     enigo: &mut impl MouseControllable,
     mut from: (i32,i32),
     to: (i32,i32),
     bounds: Option<Bounds>,
     settings: &HumanMouseSettings,
     button: MouseButton,
-) {
+    running: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+) -> bool {
     let mut rng: StdRng = match settings.rng_seed {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
@@ -146,7 +172,9 @@ pub fn human_move_and_click(
     if let Some(b) = bounds {
         if !b.contains(from) {
             let entry = b.nearest_point(from);
-            human_move_inner(enigo, from, entry, None, settings, &mut rng);
+            if !human_move_inner(enigo, from, entry, None, settings, &mut rng, running, paused) {
+                return false;
+            }
             from = entry;
         }
     }
@@ -154,18 +182,34 @@ pub fn human_move_and_click(
     // Sometimes overshoot a bit, then settle back.
     let over = maybe_overshoot(to, from, settings, &mut rng);
     if over != to {
-        human_move_inner(enigo, from, over, bounds, settings, &mut rng);
+        if !human_move_inner(enigo, from, over, bounds, settings, &mut rng, running, paused) {
+            return false;
+        }
         // short settle
-        thread::sleep(Duration::from_millis(20 + rng.gen_range(0..20)));
-        human_move_inner(enigo, over, to, bounds, settings, &mut rng);
+        if !interruptible_sleep(20 + rng.gen_range(0..20), running, paused) {
+            return false;
+        }
+        if !human_move_inner(enigo, over, to, bounds, settings, &mut rng, running, paused) {
+            return false;
+        }
     } else {
-        human_move_inner(enigo, from, to, bounds, settings, &mut rng);
+        if !human_move_inner(enigo, from, to, bounds, settings, &mut rng, running, paused) {
+            return false;
+        }
     }
 
     // Human click: press + tiny hold + release with slight randomness
+    if !running.load(Ordering::Relaxed) {
+        return false;
+    }
+
     enigo.mouse_down(button);
-    thread::sleep(Duration::from_millis(20 + rng.gen_range(0..50)));
+    if !interruptible_sleep(20 + rng.gen_range(0..50), running, paused) {
+        enigo.mouse_up(button);
+        return false;
+    }
     enigo.mouse_up(button);
+    true
 }
 
 fn human_move_inner(
@@ -175,7 +219,9 @@ fn human_move_inner(
     bounds: Option<Bounds>,
     settings: &HumanMouseSettings,
     rng: &mut StdRng,
-) {
+    running: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+) -> bool {
     // Build a bezier-like path with curvature.
     let (p0, p1, p2, p3) = make_bezier_with_wiggle(from, to, rng);
     // Approximate duration from average speed (add jitter).
@@ -196,6 +242,10 @@ fn human_move_inner(
     let jitter_hz = (settings.micro_jitter_hz * (1.0 + rng.gen_range(-0.2..0.2))).max(1.0);
 
     for i in 0..=steps {
+        if !running.load(Ordering::Relaxed) {
+            return false;
+        }
+
         let raw_t = i as f32 / steps as f32;
         let t = ease_in_out(raw_t);
 
@@ -224,12 +274,20 @@ fn human_move_inner(
         // Mid-path micro-pause
         if let Some(pause_idx) = maybe_pause_at {
             if i == pause_idx {
-                thread::sleep(Duration::from_millis(
-                    rng.gen_range(settings.min_pause_ms..=settings.max_pause_ms)
-                ));
+                if !interruptible_sleep(
+                    rng.gen_range(settings.min_pause_ms..=settings.max_pause_ms),
+                    running,
+                    paused,
+                ) {
+                    return false;
+                }
             }
         }
 
-        thread::sleep(Duration::from_millis(step_ms as u64));
+        if !interruptible_sleep(step_ms as u64, running, paused) {
+            return false;
+        }
     }
+
+    true
 }

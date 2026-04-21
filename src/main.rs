@@ -1,46 +1,15 @@
+mod domain;
 mod human_mouse;
 mod presets;
 
+use crate::domain::validation::{compile_run_plan, CompiledRunPlan, ValidationSeverity};
 use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
 use enigo::MouseControllable;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
-use crate::human_mouse::{HumanMouseSettings, human_move_and_click};
+use crate::human_mouse::{HumanMouseSettings, human_move_and_click_interruptible};
 use crate::presets::{PresetStore, Click, ClickSequence, SequenceStepType};
-
-use clap::Parser;
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Total number of random clicks to perform before stopping (0 = infinite)
-    #[arg(long = "clicks", default_value_t = 0)]
-    clicks: u32,
-
-    /// Optional min delay between clicks in ms
-    #[arg(long = "min-delay-ms", default_value_t = 75)]
-    min_delay_ms: u64,
-
-    /// Optional max delay between clicks in ms
-    #[arg(long = "max-delay-ms", default_value_t = 250)]
-    max_delay_ms: u64,
-}
-
-// ============================================================================
-// ENUMS FOR UI STATE
-// ============================================================================
-
-// ============================================================================
-// BUTTON TYPE ENUM
-// ============================================================================
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-enum ClickButton {
-    Left,
-    Right,
-}
 
 /// Main application screens - enum-based state machine
 #[derive(Clone, Debug)]
@@ -49,24 +18,22 @@ enum AppScreen {
     SequenceEditor(SequenceEditorState),
     ClickEditor(ClickEditorState),
     RunningSequence(RunningSequenceState),
-    Settings,
 }
 
 #[derive(Clone, Debug)]
 struct SequenceEditorState {
     sequence_name: String,
     selected_sequence: Option<String>,
+    validation_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct ClickEditorState {
-    editing_click: Option<String>,
     click_name: String,
     click_min_x: i32,
     click_max_x: i32,
     click_min_y: i32,
     click_max_y: i32,
-    picking_click_location: bool,
     selected_display: DisplayChoice,
     drag_start: Option<Pos2>,
     drag_end: Option<Pos2>,
@@ -79,15 +46,23 @@ struct RunningSequenceState {
     sequence_name: String,
     repetitions: u32,
     is_running: bool,
+    validation_message: Option<String>,
 }
 
 struct ClickJob {
     running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl ClickJob {
     fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+
+    fn toggle_pause(&self) -> bool {
+        let was_paused = self.paused.load(Ordering::Relaxed);
+        self.paused.store(!was_paused, Ordering::Relaxed);
+        !was_paused
     }
 }
 
@@ -98,12 +73,18 @@ static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::
 // ============================================================================
 
 /// Helper function to perform interruptible sleep.
-fn interruptible_sleep(duration_ms: u64, running: &Arc<AtomicBool>) {
+fn interruptible_sleep(duration_ms: u64, running: &Arc<AtomicBool>, paused: &Arc<AtomicBool>) {
     use std::time::Duration;
     let chunk_size = 50u64;
     for _ in 0..(duration_ms / chunk_size) {
         if !running.load(Ordering::Relaxed) {
             break;
+        }
+        while paused.load(Ordering::Relaxed) {
+            if !running.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(chunk_size));
         }
         std::thread::sleep(Duration::from_millis(chunk_size));
     }
@@ -319,55 +300,73 @@ impl AppState {
         (x, y)
     }
 
-    fn spawn_sequence(&mut self, sequence_name: String, repetitions: u32) {
+    fn spawn_sequence(&mut self, sequence_name: String, repetitions: u32) -> Result<CompiledRunPlan, String> {
         if self.job.is_some() {
-            return;
+            return Err("A sequence is already running.".to_string());
         }
 
-        let sequence = match self.preset_store.get_sequence(&sequence_name) {
-            Some(seq) => seq.clone(),
-            None => {
-                eprintln!("Sequence '{}' not found", sequence_name);
-                return;
-            }
-        };
+        let report = compile_run_plan(&self.preset_store, &sequence_name, repetitions);
+        if report.has_errors() {
+            let message = report
+                .issues
+                .into_iter()
+                .filter(|issue| issue.severity == ValidationSeverity::Error)
+                .map(|issue| issue.message)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(message);
+        }
 
-        let preset_store = self.preset_store.clone();
+        let plan = report
+            .plan
+            .ok_or_else(|| "Failed to compile a run plan.".to_string())?;
         let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let running_clone = Arc::clone(&running);
+        let paused_clone = Arc::clone(&paused);
+        let plan_for_thread = plan.clone();
 
         std::thread::spawn(move || {
-            let mut rng = rand::thread_rng();
-            let mut last_pos: Option<(i32, i32)> = None;
-            let mut repeats_remaining = repetitions;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut rng = rand::thread_rng();
+                let mut last_pos: Option<(i32, i32)> = None;
+                let mut repeats_remaining = plan_for_thread.repetitions;
 
-            loop {
-                if !running_clone.load(Ordering::Relaxed) {
-                    break;
+                loop {
+                    if !running_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    if repeats_remaining == 0 {
+                        running_clone.store(false, Ordering::Relaxed);
+                        break;
+                    }
+
+                    // Execute steps in sequence
+                    if let Err(e) = execute_run_plan(
+                        &plan_for_thread,
+                        &running_clone,
+                        &paused_clone,
+                        &mut last_pos,
+                        &mut rng,
+                    ) {
+                        eprintln!("Error executing sequence: {}", e);
+                        running_clone.store(false, Ordering::Relaxed);
+                        break;
+                    }
+
+                    repeats_remaining -= 1;
                 }
+            }));
 
-                if repeats_remaining == 0 {
-                    running_clone.store(false, Ordering::Relaxed);
-                    break;
-                }
-
-                // Execute steps in sequence
-                if let Err(e) = execute_sequence_steps(
-                    &sequence,
-                    &preset_store,
-                    &running_clone,
-                    &mut last_pos,
-                    &mut rng,
-                ) {
-                    eprintln!("Error executing sequence: {}", e);
-                    break;
-                }
-
-                repeats_remaining -= 1;
+            if result.is_err() {
+                eprintln!("Sequence worker panicked");
+                running_clone.store(false, Ordering::Relaxed);
             }
         });
 
-        self.job = Some(ClickJob { running });
+        self.job = Some(ClickJob { running, paused });
+        Ok(plan)
     }
 
     fn stop_sequence(&mut self) {
@@ -382,80 +381,56 @@ impl AppState {
 // SEQUENCE EXECUTION
 // ============================================================================
 
-fn execute_sequence_steps(
-    sequence: &ClickSequence,
-    preset_store: &PresetStore,
+fn execute_run_plan(
+    plan: &CompiledRunPlan,
     running: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     last_pos: &mut Option<(i32, i32)>,
     rng: &mut rand::rngs::ThreadRng,
 ) -> Result<(), String> {
     use rand::Rng;
     use enigo::MouseButton;
 
-    for step in &sequence.steps {
+    for step in &plan.steps {
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
-        match step {
-            SequenceStepType::Click {
-                click_name,
-                min_interval: min_int,
-                max_interval: max_int,
-            } => {
-                let click = preset_store
-                    .get_click(click_name)
-                    .ok_or_else(|| format!("Click '{}' not found", click_name))?;
+        let click_x = rng.gen_range(step.min_x..=step.max_x);
+        let click_y = rng.gen_range(step.min_y..=step.max_y);
 
-                // Randomize click coordinates within the bounding box
-                let click_x = rng.gen_range(click.min_x..=click.max_x);
-                let click_y = rng.gen_range(click.min_y..=click.max_y);
+        {
+            let mut en = ENIGO.lock();
+            let from = last_pos.unwrap_or((click_x - 40, click_y - 40));
+            let button = match step.button_type.as_str() {
+                "Right" => MouseButton::Right,
+                _ => MouseButton::Left,
+            };
 
-                // Perform the click
-                {
-                    let mut en = ENIGO.lock();
-                    let from = last_pos.unwrap_or((click_x - 40, click_y - 40));
-                    let button = match click.button_type.as_str() {
-                        "Right" => MouseButton::Right,
-                        _ => MouseButton::Left,
-                    };
-
-                    human_move_and_click(
-                        &mut *en,
-                        from,
-                        (click_x, click_y),
-                        None,
-                        &HumanMouseSettings::default(),
-                        button,
-                    );
-                }
-
-                *last_pos = Some((click_x, click_y));
-
-                // Randomize interval between min and max
-                let interval_secs = if max_int > min_int {
-                    rng.gen_range(*min_int..=*max_int)
-                } else {
-                    *min_int
-                };
-                let ms = (interval_secs * 1000.0) as u64;
-                if ms > 0 {
-                    interruptible_sleep(ms, running);
-                }
+            if !human_move_and_click_interruptible(
+                &mut *en,
+                from,
+                (click_x, click_y),
+                None,
+                &HumanMouseSettings::default(),
+                button,
+                running,
+                paused,
+            ) {
+                break;
             }
-            SequenceStepType::Subsequence { sequence_name } => {
-                let sub_sequence = preset_store
-                    .get_sequence(sequence_name)
-                    .ok_or_else(|| format!("Sequence '{}' not found", sequence_name))?;
+        }
 
-                execute_sequence_steps(
-                    sub_sequence,
-                    preset_store,
-                    running,
-                    last_pos,
-                    rng,
-                )?;
-            }
+        *last_pos = Some((click_x, click_y));
+
+        let interval_secs = if step.max_interval_secs > step.min_interval_secs {
+            rng.gen_range(step.min_interval_secs..=step.max_interval_secs)
+        } else {
+            step.min_interval_secs
+        };
+        let ms = (interval_secs * 1000.0) as u64;
+        if ms > 0 {
+            interruptible_sleep(ms, running, paused);
         }
     }
 
@@ -468,9 +443,30 @@ fn execute_sequence_steps(
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Set window to Normal level when not in location picker (allows minimize)
+        if matches!(self.current_screen, AppScreen::RunningSequence(_))
+            && ctx.input(|i| i.key_pressed(egui::Key::F3))
+        {
+            if let Some(job) = &self.job {
+                let paused_now = job.toggle_pause();
+                eprintln!(
+                    "{}",
+                    if paused_now {
+                        "Execution paused by F3."
+                    } else {
+                        "Execution resumed by F3."
+                    }
+                );
+            }
+        }
+
+        // Set window to Normal level and opaque when not in location picker (allows minimize)
         if !self.picking_location {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::Normal));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
+        } else {
+            // When in picking mode, ensure transparency is enabled upfront
+            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
         }
 
         // -------- Location Picker Overlay (with drag-based selection) --------
@@ -534,7 +530,6 @@ impl eframe::App for AppState {
                                 editor.click_max_y = y1.max(y2);
                                 editor.drag_start = None;
                                 editor.drag_end = None;
-                                editor.picking_click_location = false;
                             }
                         }
                         // Exit the location picker and restore window
@@ -600,9 +595,14 @@ impl eframe::App for AppState {
             AppScreen::RunningSequence(running_state) => {
                 self.render_running_sequence(ctx, running_state.clone())
             }
-            AppScreen::Settings => {
-                self.render_settings(ctx);
-            }
+        }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.picking_location {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 0).to_normalized_gamma_f32()
+        } else {
+            Color32::from_rgb(12, 12, 12).to_normalized_gamma_f32()
         }
     }
 }
@@ -621,19 +621,11 @@ impl AppState {
 
                 ui.add_space(30.0);
 
-                if ui.button(egui::RichText::new("New Sequence").size(20.0)).clicked() {
+                if ui.button(egui::RichText::new("Sequences").size(20.0)).clicked() {
                     self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
                         sequence_name: String::new(),
                         selected_sequence: None,
-                    });
-                }
-
-                ui.add_space(15.0);
-
-                if ui.button(egui::RichText::new("Edit Sequence").size(20.0)).clicked() {
-                    self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
-                        sequence_name: String::new(),
-                        selected_sequence: None,
+                        validation_message: None,
                     });
                 }
 
@@ -641,13 +633,11 @@ impl AppState {
 
                 if ui.button(egui::RichText::new("Manage Clicks").size(20.0)).clicked() {
                     self.current_screen = AppScreen::ClickEditor(ClickEditorState {
-                        editing_click: None,
                         click_name: String::new(),
                         click_min_x: 0,
                         click_max_x: 0,
                         click_min_y: 0,
                         click_max_y: 0,
-                        picking_click_location: false,
                         selected_display: DisplayChoice::All,
                         drag_start: None,
                         drag_end: None,
@@ -656,10 +646,43 @@ impl AppState {
                     });
                 }
 
-                ui.add_space(15.0);
+                ui.add_space(25.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.heading("Run Saved Sequence");
 
-                if ui.button(egui::RichText::new("Settings").size(20.0)).clicked() {
-                    self.current_screen = AppScreen::Settings;
+                let sequence_names: Vec<String> = self
+                    .preset_store
+                    .sequences
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+
+                if sequence_names.is_empty() {
+                    ui.label("No saved sequences yet.");
+                } else {
+                    for seq_name in sequence_names {
+                        ui.horizontal(|ui| {
+                            ui.label(&seq_name);
+
+                            if ui.button("Run").clicked() {
+                                self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
+                                    sequence_name: seq_name.clone(),
+                                    repetitions: 1,
+                                    is_running: false,
+                                    validation_message: None,
+                                });
+                            }
+
+                            if ui.button("Edit").clicked() {
+                                self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
+                                    sequence_name: seq_name.clone(),
+                                    selected_sequence: Some(seq_name.clone()),
+                                    validation_message: None,
+                                });
+                            }
+                        });
+                    }
                 }
 
                 ui.add_space(15.0);
@@ -710,6 +733,7 @@ impl AppState {
                             if let Some(seq_name) = &editor.selected_sequence {
                                 if let Some(seq) = self.preset_store.get_sequence(seq_name) {
                                     editor.sequence_name = seq.name.clone();
+                                    editor.validation_message = None;
                                 }
                             }
                         }
@@ -732,22 +756,10 @@ impl AppState {
                                     ui.horizontal(|ui| {
                                         match step {
                                             SequenceStepType::Click { click_name, min_interval, max_interval } => {
-                                                ui.label(format!("Step {}: Click '{}' ({}s-{}s)", i + 1, click_name, min_interval, max_interval));
+                                                ui.label(format!("Step {}: Click '{}' ({:.2}s-{:.2}s)", i + 1, click_name, min_interval, max_interval));
                                             }
                                             SequenceStepType::Subsequence { sequence_name } => {
                                                 ui.label(format!("Step {}: Sequence '{}'", i + 1, sequence_name));
-                                            }
-                                        }
-
-                                        // Edit interval button for clicks
-                                        if matches!(step, SequenceStepType::Click { .. }) && ui.button("Edit").clicked() {
-                                            if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
-                                                if *i < seq_mut.steps.len() {
-                                                    if let SequenceStepType::Click { .. } = &mut seq_mut.steps[*i] {
-                                                        // Toggle interval editing or modify inline
-                                                        // For now, show the current values via label
-                                                    }
-                                                }
                                             }
                                         }
 
@@ -781,6 +793,31 @@ impl AppState {
                     }
 
                     if self.preset_store.get_sequence(&editor.sequence_name).is_some() {
+                        let validation_report = compile_run_plan(&self.preset_store, &editor.sequence_name, 1);
+
+                        ui.group(|ui| {
+                            ui.label("Validation Preview:");
+                            if let Some(plan) = &validation_report.plan {
+                                ui.label(format!(
+                                    "{} click steps per run, estimated duration ~{:.1}s",
+                                    plan.steps.len(),
+                                    plan.estimated_duration_ms as f32 / 1000.0
+                                ));
+                            }
+
+                            if validation_report.issues.is_empty() {
+                                ui.colored_label(Color32::LIGHT_GREEN, "No validation issues detected.");
+                            } else {
+                                for issue in validation_report.issues.iter().take(4) {
+                                    let color = match issue.severity {
+                                        ValidationSeverity::Error => Color32::LIGHT_RED,
+                                        ValidationSeverity::Warning => Color32::YELLOW,
+                                    };
+                                    ui.colored_label(color, &issue.message);
+                                }
+                            }
+                        });
+
                         ui.separator();
 
                         ui.group(|ui| {
@@ -860,23 +897,27 @@ impl AppState {
                     ui.separator();
 
                     ui.horizontal(|ui| {
-                        if ui.button("Run Sequence").clicked() {
-                            if let Some(seq) = self.preset_store.get_sequence(&editor.sequence_name) {
-                                self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
-                                    sequence_name: seq.name.clone(),
-                                    repetitions: 1,
-                                    is_running: false,
-                                });
-                            }
-                        }
+                        if ui.button("Run").clicked() {
+                            let run_name = if self.preset_store.get_sequence(&editor.sequence_name).is_some() {
+                                Some(editor.sequence_name.clone())
+                            } else {
+                                editor
+                                    .selected_sequence
+                                    .as_ref()
+                                    .and_then(|name| self.preset_store.get_sequence(name).map(|_| name.clone()))
+                            };
 
-                        if ui.button("Save & Run").clicked() {
-                            if let Some(seq) = self.preset_store.get_sequence(&editor.sequence_name) {
+                            if let Some(name) = run_name {
                                 self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
-                                    sequence_name: seq.name.clone(),
+                                    sequence_name: name,
                                     repetitions: 1,
                                     is_running: false,
+                                    validation_message: editor.validation_message.clone(),
                                 });
+                            } else {
+                                editor.validation_message = Some(
+                                    "Select or create a valid sequence before running.".to_string(),
+                                );
                             }
                         }
 
@@ -886,6 +927,11 @@ impl AppState {
                             self.current_screen = AppScreen::MainMenu;
                         }
                     });
+
+                    if let Some(message) = &editor.validation_message {
+                        ui.add_space(8.0);
+                        ui.colored_label(Color32::YELLOW, message);
+                    }
                 });
         });
 
@@ -958,7 +1004,6 @@ impl AppState {
                         });
 
                         if ui.button("Pick Location from Screen").clicked() {
-                            editor.picking_click_location = true;
                             self.display_choice = editor.selected_display.clone();
                             self.enter_location_picker(ctx);
                         }
@@ -997,7 +1042,6 @@ impl AppState {
                                 ui.label(format!("{}: X({}-{}) Y({}-{})", click_name, min_x, max_x, min_y, max_y));
 
                                 if ui.button("Edit").clicked() {
-                                    editor.editing_click = Some(click_name.clone());
                                     editor.click_name = click_name.clone();
                                     editor.click_min_x = min_x;
                                     editor.click_max_x = max_x;
@@ -1022,6 +1066,16 @@ impl AppState {
 
     fn render_running_sequence(&mut self, ctx: &egui::Context, mut running: RunningSequenceState) {
         let mut go_back = false;
+        let worker_stopped = self
+            .job
+            .as_ref()
+            .map(|job| !job.running.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if worker_stopped {
+            self.job = None;
+            running.is_running = false;
+        }
+
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.heading("Running Sequence");
             ui.horizontal(|ui| {
@@ -1052,10 +1106,47 @@ impl AppState {
 
                 if !running.is_running {
                     if ui.button(egui::RichText::new("Start").size(20.0)).clicked() {
-                        self.spawn_sequence(running.sequence_name.clone(), running.repetitions);
-                        running.is_running = true;
+                        match self.spawn_sequence(running.sequence_name.clone(), running.repetitions) {
+                            Ok(plan) => {
+                                let warning_suffix = if plan.warnings.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {} warning(s) noted during validation.", plan.warnings.len())
+                                };
+                                running.validation_message = Some(format!(
+                                    "Validated '{}' with {} click steps. Estimated duration ~{:.1}s.{}",
+                                    plan.sequence_name,
+                                    plan.steps.len(),
+                                    plan.estimated_duration_ms as f32 / 1000.0,
+                                    warning_suffix
+                                ));
+                                running.is_running = true;
+                            }
+                            Err(err) => {
+                                running.validation_message = Some(err);
+                                running.is_running = false;
+                            }
+                        }
                     }
                 } else {
+                    let is_paused = self
+                        .job
+                        .as_ref()
+                        .map(|job| job.paused.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    let pause_label = if is_paused { "Resume (F3)" } else { "Pause (F3)" };
+
+                    if ui.button(egui::RichText::new(pause_label).size(20.0)).clicked() {
+                        if let Some(job) = &self.job {
+                            let paused_now = job.toggle_pause();
+                            running.validation_message = Some(if paused_now {
+                                "Execution paused.".to_string()
+                            } else {
+                                "Execution resumed.".to_string()
+                            });
+                        }
+                    }
+
                     if ui.button(egui::RichText::new("Stop").size(20.0)).clicked() {
                         self.stop_sequence();
                         running.is_running = false;
@@ -1065,12 +1156,19 @@ impl AppState {
                 ui.add_space(30.0);
 
                 if let Some(job) = &self.job {
-                    let status = if job.running.load(Ordering::Relaxed) {
-                        "Running..."
-                    } else {
+                    let status = if !job.running.load(Ordering::Relaxed) {
                         "Stopped"
+                    } else if job.paused.load(Ordering::Relaxed) {
+                        "Paused"
+                    } else {
+                        "Running..."
                     };
                     ui.label(format!("Status: {}", status));
+                }
+
+                if let Some(message) = &running.validation_message {
+                    ui.add_space(12.0);
+                    ui.label(message);
                 }
             });
         });
@@ -1078,62 +1176,10 @@ impl AppState {
         self.current_screen = AppScreen::RunningSequence(running);
     }
 
-    fn render_settings(&mut self, ctx: &egui::Context) {
-        let mut go_back = false;
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.heading("Settings - Run Sequence");
-            ui.horizontal(|ui| {
-                if ui.button("← Back to Menu").clicked() {
-                    go_back = true;
-                }
-            });
-        });
-
-        if go_back {
-            self.current_screen = AppScreen::MainMenu;
-            return;
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.heading("Available Sequences:");
-                    
-                    if self.preset_store.sequences.is_empty() {
-                        ui.label("(No sequences created yet)");
-                    } else {
-                        for seq in &self.preset_store.sequences {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{}  ({} steps)", seq.name, seq.steps.len()));
-                                
-                                if ui.button("Run").clicked() {
-                                    self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
-                                        sequence_name: seq.name.clone(),
-                                        repetitions: 1,
-                                        is_running: false,
-                                    });
-                                    return;
-                                }
-
-                                if ui.button("Edit").clicked() {
-                                    self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
-                                        sequence_name: seq.name.clone(),
-                                        selected_sequence: None,
-                                    });
-                                    return;
-                                }
-                            });
-                        }
-                    }
-                });
-        });
-    }
 }
 
 fn main() -> eframe::Result<()> {
     let mut opts = eframe::NativeOptions::default();
-    let _args = Args::parse();
 
     opts.viewport.transparent = Some(true);
     opts.viewport.resizable = Some(true);
